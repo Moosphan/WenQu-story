@@ -1,0 +1,10 @@
+- insert:
+    - id: hulk-story-skill
+      name: dsh-hulk-story
+    - id: hulk-story-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: hulk_story
+        transport: stdio
+        command: hulk-story
+        args: [mcp, serve]
