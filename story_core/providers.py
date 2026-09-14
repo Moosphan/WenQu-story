@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .context_compiler import compile_task, request_envelope
+from .context_calibration import usage_breakdown
 from .errors import StoryError
 from .model_json import parse_object
 from .diagnostics import http_failure, transport_failure
@@ -36,6 +37,7 @@ class OpenAICompatible:
 
     def generate(self, task):
         self.last_usage = None
+        self.last_usage_breakdown = None
         self.last_context = None
         compiled = compile_task(task, output_reserve=MAX_TASK_OUTPUT_TOKENS, model=self.model)
         self.last_context = compiled.diagnostics
@@ -49,6 +51,7 @@ class OpenAICompatible:
             if response.status_code!=200:
                 raise http_failure(response.status_code)
             data=response.json()
+            self.last_usage_breakdown = usage_breakdown(data.get('usage'), 'compatible')
             usage = data.get('usage', {}).get('total_tokens')
             self.last_usage = usage if type(usage) is int and usage >= 0 else None
             choice=data['choices'][0]
@@ -100,6 +103,7 @@ def run_worker(service, book_id, provider, worker_id=None):
         with service.store.write(book_id) as conn:
             service.store.event(conn, book_id, 'provider_call_started', call, task['run_id'])
         provider.last_usage = None
+        provider.last_usage_breakdown = None
         provider.last_metadata = None
         provider.last_context = None
         outcome, error_code = 'failed', None
@@ -148,5 +152,6 @@ def run_worker(service, book_id, provider, worker_id=None):
                 service.store.event(conn, book_id, 'provider_usage', {
                     **call, 'status': outcome, 'error_code': error_code, 'diagnosis': diagnosis,
                     'finished_at': time.time(), 'reported_tokens': usage,
+                    'usage_breakdown': getattr(provider, 'last_usage_breakdown', None),
                     'execution': getattr(provider, 'last_metadata', None),
                     'context': getattr(provider, 'last_context', None)}, task['run_id'])

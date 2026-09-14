@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 
 from .context_compiler import compile_task, request_envelope
+from .context_calibration import usage_breakdown
 from .errors import StoryError
 from .model_json import parse_object
 from .diagnostics import http_failure, transport_failure
@@ -67,6 +68,7 @@ class ClaudeCode:
 
     def generate(self, task, cancelled=None):
         self.last_usage = None
+        self.last_usage_breakdown = None
         self.last_metadata = None
         self.last_context = None
         if self.native_transport == 'native_deepseek':
@@ -93,6 +95,7 @@ class ClaudeCode:
             data = json.loads(raw)
             if isinstance(data, dict):
                 usage = data.get('usage', {})
+                self.last_usage_breakdown = usage_breakdown(usage, 'native')
                 counts = [usage.get(key, 0) for key in ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')]
                 if usage and all(type(value) is int and value >= 0 for value in counts):
                     self.last_usage = sum(counts)
@@ -151,6 +154,7 @@ class ClaudeCode:
             if response.status_code != 200:
                 raise http_failure(response.status_code, 'HOST_NATIVE_ERROR')
             data = response.json()
+            self.last_usage_breakdown = usage_breakdown(data.get('usage'), 'compatible')
             usage = data.get('usage', {}).get('total_tokens')
             self.last_usage = usage if type(usage) is int and usage >= 0 else None
             choice = data['choices'][0]
