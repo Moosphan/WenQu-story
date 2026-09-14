@@ -144,3 +144,33 @@ def test_idea_job_persists_real_provider_result_as_noncanon_cards(tmp_path):
     assert completed['status'] == 'complete'
     assert all(card['is_canon'] is False for card in completed['ideas'])
     assert service.idea_job(job['job_id'])['ideas'][0]['title'] == '《借火人》'
+
+
+def test_character_rename_updates_current_text_and_context_not_history(tmp_path):
+    from copy import deepcopy
+    from story_core.storage import dumps
+    service, book_id = make(tmp_path)
+    for _ in range(2):
+        task = service.next_task(book_id)
+        service.submit_task(task['task_id'], task['lease_id'], result_for(task))
+    book = service.get_book(book_id)
+    old = book['brief']['characters'][0]['name']
+    with service.store.write(book_id) as conn:
+        conn.execute('INSERT INTO chapter_versions VALUES (?,?,?,?,?,?)', ('old', book_id, 1, old + '出门', old + '看见灵草。', 1))
+        conn.execute('INSERT INTO chapters VALUES (?,?,?,?)', (book_id, 1, 'old', 'committed'))
+        conn.execute('INSERT INTO chunks VALUES (?,?,?,?,?,?)', ('chunk', book_id, 1, 'old', old + '看见灵草。', 0))
+        conn.execute('INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?)', ('mem', book_id, 1, 'old', 'entity', old, old + '采药', old + '看见灵草。', 'public', dumps({'name': old})))
+    brief, plan = deepcopy(book['brief']), deepcopy(book['plan'])
+    brief['characters'][0]['name'] = '谢停舟'
+    plan['chapters'][0]['goal'] = old + '采药'
+    saved = service.update_story_bible(book_id, brief, plan, book['revision'])
+    assert saved['renamed_characters'] == {old: '谢停舟'}
+    assert saved['plan']['chapters'][0]['goal'] == '谢停舟采药'
+    with service.store.read() as conn:
+        current = conn.execute('SELECT v.* FROM chapters c JOIN chapter_versions v ON v.id=c.version_id WHERE c.book_id=?', (book_id,)).fetchone()
+        assert current['body'] == '谢停舟看见灵草。'
+        assert current['id'] != 'old'
+        assert conn.execute("SELECT body FROM chapter_versions WHERE id='old'").fetchone()[0] == old + '看见灵草。'
+        memory = conn.execute('SELECT * FROM memories WHERE book_id=?', (book_id,)).fetchone()
+        assert memory['key'] == '谢停舟' and memory['version_id'] == current['id']
+        assert conn.execute('SELECT text FROM chunks WHERE book_id=?', (book_id,)).fetchone()[0] == '谢停舟看见灵草。'

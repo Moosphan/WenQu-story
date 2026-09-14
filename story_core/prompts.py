@@ -33,8 +33,13 @@ def reader_profile(profile_id):
 EXPANSION_GUIDANCE = "以 candidate 为底稿补写返修本章，结合 reviews/feedback_items 修正问题，补足到 length_requirement.target 字附近。必须输出完整 title/body，不允许 patches，不允许只输出建议。expansion_requirement 给出原稿与目标的差额；原稿已够长时也不能因删改跌破下限。保留已成立的事件、线索、人物声线、知识边界和章节结局，在本章计划内展开行动受阻、试探对话、选择及后果；不得凭空改变设定或引入无关支线。不能靠重复解释、回顾或空泛感悟灌水。删去错误细节时用符合设定的行动承接，不把补写做成缩写。标点空白不计字数。可附 revision_response，逐项对应原 feedback_id 并如实说明修改，不把自述当成审稿通过。"
 
 
+FULL_BODY_GUIDANCE = "基于 candidate 和 reviews/feedback_items 修改本章。必须返回完整 title/body，不返回 patches，不只返回修改建议。未修改段落也必须保留；不重复改动已解决问题。保持人物、事件顺序和结局，满足 length_requirement.target 和字数范围。JSON 字符串中的英文双引号、换行和反斜线必须正确转义，不写 Markdown 代码围栏。可附 revision_response，使用原 feedback_id。"
+
+
 def instruction(stage, reader_profile_id=None, revision_mode=None):
     guidance = COMMON + "\n" + (EXPANSION_GUIDANCE if stage == "revise" and revision_mode == "expand_full_body" else GUIDANCE[stage])
+    if stage == 'revise' and revision_mode == 'full_body':
+        guidance = COMMON + '\n' + FULL_BODY_GUIDANCE
     if stage in ('outline', 'draft', 'revise', 'continuity', 'reader'):
         guidance += '\n' + CHAPTER_TITLE_GUIDANCE
     if stage in ('draft', 'revise', 'continuity', 'reader'):

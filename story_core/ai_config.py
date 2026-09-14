@@ -138,10 +138,11 @@ class AISettings:
         provider = settings['provider']
         return {'configured': True, 'provider': provider, 'mode': settings['mode'],
                 'base_url': settings.get('base_url', ''), 'model': settings.get('model', ''),
+                'host_options': settings.get('host_options', {}),
                 'key_configured': bool(self.vault.get(provider)) if settings['mode'] == 'api' else True,
                 **base}
 
-    def save(self, provider, base_url='', model='', api_key=''):
+    def save(self, provider, base_url='', model='', api_key='', host_options=None):
         if provider not in PROVIDERS:
             raise StoryError('INVALID_PROVIDER', '请选择受支持的平台或自定义兼容接口。')
         preset = PROVIDERS[provider]
@@ -150,7 +151,16 @@ class AISettings:
             model = _clean_model(model)
             if model and not _valid_model(model):
                 raise StoryError('INVALID_PROVIDER', '模型名称需要为 1–160 个可见字符。')
-            data = {'provider': provider, 'mode': mode, 'base_url': '', 'model': model}
+            previous = self._read() or {}
+            options = host_options if host_options is not None else previous.get('host_options', {}) if previous.get('provider') == provider else {}
+            if not isinstance(options, dict) or set(options) - {'transport', 'thinking', 'revision_model', 'auxiliary_model'}:
+                raise StoryError('INVALID_PROVIDER', '宿主连接选项无效。')
+            if options.get('transport', 'cli') not in ('cli', 'native_deepseek') or options.get('thinking', 'inherit') not in ('inherit', 'off'):
+                raise StoryError('INVALID_PROVIDER', '宿主传输或思考模式无效。')
+            for field in ('revision_model', 'auxiliary_model'):
+                if field in options and not _valid_model(options[field]):
+                    raise StoryError('INVALID_PROVIDER', '宿主阶段模型名无效。')
+            data = {'provider': provider, 'mode': mode, 'base_url': '', 'model': model, 'host_options': options}
         else:
             base_url = (base_url or preset['base_url']).strip().rstrip('/')
             model = (model or preset['model']).strip()

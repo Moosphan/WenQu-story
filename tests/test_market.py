@@ -8,6 +8,27 @@ FANQIE_PAGE = '''<script>window.__INITIAL_STATE__={"rank":{"book_list":[
 ]}};</script>'''
 
 
+def test_encoded_rank_uses_matching_public_detail_page():
+    import json
+    import pytest
+    page = 'window.__INITIAL_STATE__=' + json.dumps({'rank': {'book_list': [
+        {'currentPos': 1, 'bookName': '惹\ue49c枝', 'bookId': '123', 'abstract': '\ue500'}]}})
+    detail = 'window.__INITIAL_STATE__=' + json.dumps({'page': {'bookId': '123', 'bookName': '惹金枝', 'abstract': '测试简介', 'author': '测试作者'}})
+    urls = []
+    result = parse_fanqie_rank(page, lambda url: urls.append(url) or detail)
+    assert result[0]['title'] == '惹金枝'
+    assert result[0]['summary'] == '测试简介'
+    assert urls == ['https://fanqienovel.com/page/123']
+    with pytest.raises(StoryError):
+        parse_fanqie_rank(page, lambda url: detail.replace('123', '456'))
+
+
+def test_public_state_undefined_field_does_not_corrupt_string_content():
+    from story_core.market import _assignment_json
+    result = _assignment_json('window.__INITIAL_STATE__={"description":undefined,"title":"undefined不是书名"};')
+    assert result == {'description': None, 'title': 'undefined不是书名'}
+
+
 def test_fanqie_public_rank_parser_requires_verifiable_title_and_rank():
     items = parse_fanqie_rank(FANQIE_PAGE)
     assert [(item['rank'], item['title']) for item in items] == [(1, '夜雨旧宅'), (2, '灵田问道')]
@@ -31,19 +52,20 @@ def test_market_snapshot_caches_public_fetch_and_marks_failed_refresh_stale(tmp_
     assert cached['items'] == fresh['items']
     stale = service.market_snapshot('fanqie_rank', refresh=True, http_get=lambda url: '<html>changed</html>')
     assert stale['status'] == 'stale' and stale['items'] == fresh['items']
-    qidian = service.market_snapshot('qidian_rank', refresh=True)
-    assert qidian['status'] == 'adapter_unavailable' and not qidian['items']
+    qidian = service.market_snapshot('qidian_rank', refresh=True, http_get=lambda url: '<script src="probe.js"></script>')
+    assert qidian['status'] == 'unavailable' and not qidian['items']
 
 
-def test_market_sources_are_available_over_http(tmp_path):
+def test_market_sources_are_available_over_http(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from story_core.http import create_app
 
+    monkeypatch.setattr('story_core.market._http_get', lambda url: '<script src="probe.js"></script>')
     with TestClient(create_app(tmp_path)) as client:
         sources = client.get('/api/market/sources').json()['sources']
-        assert {source['source_id'] for source in sources} == {'fanqie_rank', 'qidian_rank'}
+        assert {source['source_id'] for source in sources} >= {'fanqie_rank', 'qidian_rank', 'fanqie_male', 'fanqie_male_new'}
         qidian = client.get('/api/market/qidian_rank').json()
-        assert qidian['status'] == 'adapter_unavailable'
+        assert qidian['status'] == 'unavailable'
 
 
 def test_market_signals_keep_source_evidence_and_ideas_remain_author_suggestions(tmp_path):
