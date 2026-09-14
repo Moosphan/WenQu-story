@@ -223,7 +223,8 @@ def invalidate_version(conn, book_id, version_id, *, branch_id='main'):
 
 
 def current_state(conn, book_id, entity_ids, *, through_chapter=None, story_time,
-                  role='author', pov_entity_id=None, branch_id='main', include_author_plan=False):
+                  role='author', pov_entity_id=None, branch_id='main', include_author_plan=False,
+                  fact_ids=None):
     """Project verified assertions after book, version, time, and knowledge guards.
 
     No top-k is applied to state: the compiler must budget selected facts and
@@ -238,16 +239,18 @@ def current_state(conn, book_id, entity_ids, *, through_chapter=None, story_time
     if pov_entity_id:
         _entity(conn, book_id, pov_entity_id, branch_id)
     ids = list(dict.fromkeys(entity_ids))
-    if not ids:
+    if not ids and not fact_ids:
         return []
     # json_each avoids SQLite variable limits for explicit large entity lists.
     params = dict(book=book_id, branch=branch_id, boundary=boundary, instant=story_time,
-                  entities=dumps(ids), role=role, pov=pov_entity_id or '', plans=int(include_author_plan))
+                  entities=dumps(ids), role=role, pov=pov_entity_id or '', plans=int(include_author_plan),
+                  facts=dumps(fact_ids) if fact_ids is not None else None)
     rows = conn.execute(_INVALID_VERSIONS + '''SELECT e.*, f.subject_entity_id, f.predicate, f.scope, f.owner_entity_id
       FROM lm_fact_events e JOIN lm_facts f ON f.id=e.fact_id
       JOIN chapters c ON c.book_id=e.book_id AND c.number=e.source_chapter AND c.version_id=e.source_version
       WHERE e.book_id=:book AND e.branch_id=:branch AND c.status='committed'
-      AND f.subject_entity_id IN (SELECT value FROM json_each(:entities))
+      AND ((:facts IS NULL AND f.subject_entity_id IN (SELECT value FROM json_each(:entities)))
+           OR f.id IN (SELECT value FROM json_each(:facts)))
       AND e.verified=1 AND e.invalidated=0 AND e.source_version NOT IN (SELECT version_id FROM invalid)
       AND e.source_chapter<=:boundary AND e.known_from_chapter<=:boundary
       AND e.story_valid_from<=:instant AND (e.story_valid_to IS NULL OR :instant<e.story_valid_to)

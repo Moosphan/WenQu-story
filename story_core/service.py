@@ -779,6 +779,10 @@ class StoryService(ContextActions, MemoryActions):
             # Reader/extraction views intentionally lack author chapter_plan.
             # Keep only dependency IDs, never its future plot text.
             data['context_required_ids'] = [*plan.get('required_fact_ids', []), *plan.get('promise_ids', [])]
+            from .dependency_resolution import resolve_dependencies, attach_dependencies
+            resolved = resolve_dependencies(conn, book['book_id'], plan, run['stage'], run['chapter_number'],
+                role=role, pov_entity_id=pov_id)
+            attach_dependencies(data, resolved)
         data, schema = prepare_lookup(conn, book, run, data, schema, policy)
         compiled = ContextCompiler(policy).compile(data, schema, stage=run['stage'])
         manifest = data.get('context_manifest')
