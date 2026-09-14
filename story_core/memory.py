@@ -70,6 +70,8 @@ def index_chapter(conn, book_id, number, version_id, body, memories):
         conn.execute("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?)",
                      (uid("mem"), book_id, number, version_id, item["kind"], item["key"], item["value"],
                       item["evidence"], item.get("visibility", "reader"), dumps(item)))
+    from .retrieval import index_version
+    index_version(conn, book_id, version_id)
     # Overlapping character windows: no tokenizer dependency or English-only FTS.
     for start in range(0, len(body), 600):
         conn.execute("INSERT INTO chunks VALUES (?,?,?,?,?,?)",
@@ -215,3 +217,46 @@ def canonical_memory(conn, book_id, through_chapter):
         key = (item["kind"], item["key"], item.get("owner", ""))
         latest[key] = item
     return list(latest.values())
+
+
+def bounded_context_layers(memories, chapter_plan, chapter_number, supplement_limit=8, *,
+                           current_facts=(), scheduled_promises=()):
+    """Opt-in candidate selection; ContextCompiler applies final token budgets.
+
+    Explicit requirements and scheduled obligations are never silently capped.
+    Name/outline matches rank historical evidence only, not hard constraints.
+    Legacy context_layers remains the default shadow baseline.
+    """
+    if not isinstance(memories, list) or not isinstance(chapter_plan, dict) or type(chapter_number) is not int or chapter_number < 1:
+        raise StoryError('INVALID_REQUEST', '上下文分层参数无效。')
+    if type(supplement_limit) is not int or not 0 <= supplement_limit <= 50:
+        raise StoryError('INVALID_REQUEST', '补充记忆数量无效。')
+    pov = chapter_plan.get('pov')
+    explicit = set(chapter_plan.get('required_fact_ids') or []) | set(chapter_plan.get('required_memory_ids') or [])
+    terms = _terms(' '.join(v for v in chapter_plan.values() if isinstance(v, str)))
+    required = [dict(item, context_reason='current_state') for item in current_facts]
+    required.extend(dict(item, context_reason=item.get('context_reason', 'due_promise'), hard_constraint=True)
+                    for item in scheduled_promises)
+    candidates, withheld = [], 0
+    for index, memory in enumerate(memories):
+        if pov and memory.get('kind') == 'knowledge' and memory.get('owner') and memory['owner'] != pov:
+            withheld += 1
+            continue
+        identity = memory.get('fact_id') or memory.get('id')
+        if identity and identity in explicit:
+            required.append(dict(memory, context_reason='explicit_dependency'))
+            continue
+        # Scheduling is based on identifiers and dates, never a participant name.
+        if memory.get('kind') == 'promise':
+            due = memory.get('due_chapter')
+            if memory.get('status') not in ('paid', 'waived', 'resolved', 'cancelled') and type(due) is int and due <= chapter_number:
+                required.append(dict(memory, context_reason='due_promise'))
+            continue
+        score = sum(len(t) for t in terms if t in _memory_search_text(memory))
+        candidates.append((-score, -int((memory.get('source') or {}).get('chapter_number') or 0), index, memory))
+    candidates.sort(key=lambda item: item[:3])
+    included = {item.get('fact_id') or item.get('id') for item in required}
+    return {'required': required, 'missing_required_ids': sorted(explicit - included),
+            'supplementary': [dict(item[3], context_reason='lexical_supplement') for item in candidates[:supplement_limit]],
+            'queries': {'participants': chapter_plan.get('participants', []), 'plan_terms': sorted(terms)[:12]},
+            'pov_guard': {'pov': pov, 'withheld_knowledge_count': withheld}}

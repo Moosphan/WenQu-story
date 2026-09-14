@@ -4,9 +4,12 @@ import json
 import shutil
 import time
 from difflib import SequenceMatcher
+from dataclasses import replace
 from pathlib import Path
 
 from .model_context import model_input
+from .context_compiler import ContextCompiler, ContextPolicy
+from .context_metrics import context_usage
 from .errors import StoryError
 from .result_boundary import validate_output
 from .targeted_revision import materialize
@@ -632,6 +635,7 @@ class StoryService:
         memory_boundary = number if stage in ('ending', 'arc') else number - 1
         memories = canonical_memory(conn,book['book_id'],memory_boundary)
         data['promise_obligations'] = promise_obligations(memories, book['plan'], number)
+        data['context_selection'] = {'settled_promise_ids': [m['key'] for m in memories if m.get('kind') == 'promise' and m.get('status') in ('paid', 'waived')]}
         layers = context_layers(memories, data['chapter_plan'] or {}, number)
         # Serialize the authoritative layer once; duplicate aliases inflate requests.
         data['required_memory'] = layers['required']
@@ -755,6 +759,33 @@ class StoryService:
             schema = SCHEMAS['revise']['oneOf'][0]
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
         reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
+        policy = ContextPolicy.from_env(run['stage'])
+        policy = replace(policy, output_reserve=max(MAX_TASK_OUTPUT_TOKENS, policy.output_reserve))
+        if policy.mode == 'adaptive' and run['stage'] not in ('brief', 'outline'):
+            from .long_memory import current_state, resolve_alias, select_promises
+            plan = next((c for c in book['plan']['chapters'] if c['number'] == run['chapter_number']), {})
+            pov = plan.get('pov')
+            # An unresolved POV cannot gain author-only state or another belief.
+            pov_id = resolve_alias(conn, book['book_id'], pov) if pov else None
+            role = 'reader' if pov or run['stage'] == 'reader' else 'author'
+            if plan.get('entity_ids') and 'story_time' in plan:
+                data['current_state'] = current_state(conn, book['book_id'], plan['entity_ids'],
+                    through_chapter=run['chapter_number']-1, story_time=plan['story_time'], role=role, pov_entity_id=pov_id)
+            scheduled = select_promises(conn, book['book_id'], run['chapter_number'],
+                explicit_ids=plan.get('promise_ids', []), trigger_keys=plan.get('trigger_keys', []), role=role, pov_entity_id=pov_id)
+            data['scheduled_promises'] = scheduled['required']
+            # Reader/extraction views intentionally lack author chapter_plan.
+            # Keep only dependency IDs, never its future plot text.
+            data['context_required_ids'] = [*plan.get('required_fact_ids', []), *plan.get('promise_ids', [])]
+        compiled = ContextCompiler(policy).compile(data, schema, stage=run['stage'])
+        manifest = data.get('context_manifest')
+        data = compiled.input
+        if manifest is not None:
+            data['context_manifest'] = manifest
+        data['context_diagnostics'] = compiled.diagnostics
+        # Shadow/off preserve the existing financial reservation and gates.
+        if compiled.diagnostics['mode'] == 'adaptive':
+            reservation = compiled.reservation
         return data, schema, reservation
 
     def next_task(self, book_id, worker_id='host'):
@@ -777,11 +808,17 @@ class StoryService:
                     return _task(task)
                 return {'task_id':None,'status':'leased','lease_until':task['lease_until']}
             data, schema, reservation = self._task_spec(conn, book, run)
+            if not data['context_diagnostics']['executable']:
+                self._attention(conn,run,'本阶段上下文容量不足，请检查上下文诊断。')
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics']},run['run_id'])
+                return {'task_id':None,'status':'needs_attention','reason':'context_capacity'}
             if run['steps']>=run['max_steps'] or run['tokens']+reservation>run['budget_tokens']:
                 self._attention(conn,run,'步骤或 token 预留预算不足；可提高预算后继续。')
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'financial_budget'},run['run_id'])
                 return {'task_id':None,'status':'needs_attention','reason':'budget'}
             if len(dumps(model_input(data)).encode())>180000:
                 self._attention(conn,run,'上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。')
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'transport_bytes'},run['run_id'])
                 return {'task_id':None,'status':'needs_attention','reason':'context_limit'}
             if task:
                 conn.execute("UPDATE tasks SET status='expired' WHERE id=?",(task['id'],))
@@ -790,6 +827,7 @@ class StoryService:
                           VALUES (?,?,?,?,?,?,?,?,'leased',?,?,?,?)''',
                          (task_id,run['run_id'],book_id,run['stage'],run['chapter_number'],dumps(data),dumps(schema),book['revision'],worker_id,lease_id,now+LEASE_SECONDS,now))
             conn.execute('UPDATE runs SET steps=steps+1,tokens=tokens+? WHERE id=?',(reservation,run['run_id']))
+            self.store.event(conn,book_id,'context_compiled',{'task_id':task_id,'context':data['context_diagnostics']},run['run_id'])
             self.store.event(conn,book_id,'task_leased',{'task_id':task_id,'stage':run['stage'],'reserved_tokens':reservation},run['run_id'])
             return _task(conn.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone())
 
@@ -892,6 +930,8 @@ class StoryService:
         conn.execute("INSERT INTO chapters VALUES (?,?,?,'committed') ON CONFLICT(book_id,number) DO UPDATE SET version_id=excluded.version_id,status='committed'",(book['book_id'],number,version))
         index_chapter(conn,book['book_id'],number,version,candidate['body'],run['extraction']['memories'])
         if old:
+            from .long_memory import invalidate_version
+            invalidate_version(conn, book['book_id'], old[0])
             conn.execute("UPDATE chapters SET status='needs_review' WHERE book_id=? AND number>? AND status='committed'",(book['book_id'],number))
         conn.execute('UPDATE books SET revision=revision+1,ending=NULL WHERE id=?',(book['book_id'],))
         self.store.event(conn,book['book_id'],'chapter_committed',{'chapter_number':number,'version_id':version,'replaces':old[0] if old else None},run['run_id'])
@@ -1146,10 +1186,14 @@ class StoryService:
                 context, _, _ = self._task_spec(conn, book, run)
                 blocker = {'code': 'CONTEXT_LIMIT', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
                            'input_bytes': len(dumps(model_input(context)).encode()), 'limit_bytes': 180000}
+            if run and run['status'] == 'needs_attention' and run.get('reason') == '本阶段上下文容量不足，请检查上下文诊断。':
+                context, _, _ = self._task_spec(conn, book, run)
+                blocker = {'code': 'CONTEXT_CAPACITY', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
+                           'context': context['context_diagnostics']}
             token_usage = self._token_usage(conn, book_id)
             return {'book_id':book_id,'title':book['title'],'status':book['status'],'revision':book['revision'],
                     'chapters':counts,'target_chapters':book['settings']['chapter_count'],'run':run,'events':events,
-                    'token_usage': token_usage, 'blocker': blocker,
+                    'token_usage': token_usage, 'blocker': blocker, 'context_usage': context_usage(conn, book_id),
                     'active_task': dict(active_task) if active_task else None,
                     'execution':execution,
                     'budget_note':'tokens 为保守预留量，含重领任务；不是服务商账单。'}

@@ -46,3 +46,4 @@ docs/*
 
 !docs/16-market-research-rebuild.md
 !docs/17-bounded-context-memory-architecture.md
+!docs/18-bounded-context-implementation-progress.md

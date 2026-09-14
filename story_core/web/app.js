@@ -519,6 +519,17 @@ function renderContextInspector(task = state.task) {
   const inspector = element('context-inspector'); const sources = element('context-sources');
   inspector.hidden = !task?.task_id; sources.replaceChildren();
   if (!task?.task_id) return;
+  const context = task.input?.context_diagnostics;
+  if (context) {
+    const group = node('section', undefined, 'context-group');
+    group.append(node('span', `上下文用量 · ${context.mode === 'shadow' ? '影子测量' : context.mode === 'off' ? '旧策略' : '自适应装箱'}`, 'field-label'));
+    group.append(node('p', `${context.estimated ? '保守估算' : 'Token 计数'} ${formatTokens(context.final_tokens)} · 软目标 ${formatTokens(context.soft_target)} · 输出预留 ${formatTokens(context.output_reserve)} · 其他开销预留 ${formatTokens(context.overhead_reserve)}`, 'hint'));
+    group.append(node('p', `模型窗口：${context.context_window ? formatTokens(context.context_window) : '尚未配置'} · 整理后 ${formatTokens(context.organized_tokens)} · ${context.mode === 'shadow' ? '仅测量，当前请求未裁剪' : '各层可借用空余额度'}`, 'hint'));
+    const layerNames = { core: '核心约定', plan: '本章规划', state: '状态', obligations: '义务', recent: '近期承接', history: '历史证据', stage: '阶段资料' };
+    group.append(node('p', Object.entries(context.layer_tokens || {}).map(([key, value]) => `${layerNames[key] || key} ${formatTokens(value)}`).join(' · '), 'hint'));
+    if (context.missing_hard_ids?.length) group.append(node('p', `缺少明确依赖：${context.missing_hard_ids.join('、')}`, 'hint'));
+    sources.append(group);
+  }
   const manifest = task.input?.context_manifest;
   if (!manifest) { element('context-summary').textContent = '当前任务没有可用上下文清单'; sources.append(node('p', '这不会授予额外检索权限。', 'hint')); return; }
   const role = manifest.role === 'reader' ? '读者任务' : '作者任务';
@@ -705,6 +716,13 @@ function renderExecutionSummary() {
     return;
   }
   const blocker = state.status?.blocker;
+  if (blocker?.code === 'CONTEXT_CAPACITY') {
+    const context = blocker.context || {};
+    box.classList.add('is-failed'); title.textContent = `尚未启动：第 ${blocker.chapter_number} 章 · ${stages[blocker.stage]}`;
+    const missing = context.missing_hard_ids?.length ? `待补齐依赖：${context.missing_hard_ids.join('、')}。` : '';
+    detail.textContent = `必要资料 ${formatTokens(context.hard_tokens)} · 输出预留 ${formatTokens(context.output_reserve)} · 其他开销预留 ${formatTokens(context.overhead_reserve)} · 模型窗口 ${context.context_window ? formatTokens(context.context_window) : '尚未配置'}。${missing}请核对模型容量或调整本章规划，已保存正文保留。`;
+    return;
+  }
   if (blocker?.code === 'CONTEXT_LIMIT') {
     box.classList.add('is-failed'); title.textContent = `尚未启动：第 ${blocker.chapter_number} 章 · ${stages[blocker.stage]}`;
     detail.textContent = `本地上下文检查拦截，尚未调用模型。当前请求 ${(blocker.input_bytes / 1024).toFixed(1)} KB，上限 ${(blocker.limit_bytes / 1024).toFixed(1)} KB。已保存正文和记忆均保留；这不是上一任务失败，也不是 Token 预算不足。`;

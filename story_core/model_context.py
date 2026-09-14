@@ -16,4 +16,4 @@ def model_input(data):
         if isinstance(result.get('evidence'), str) and isinstance(source, dict) and source.get('quote') == result['evidence']:
             source.pop('quote')
         return result
-    return compact({key: value for key, value in data.items() if key != 'context_manifest'})
+    return compact({key: value for key, value in data.items() if key not in ('context_manifest', 'context_diagnostics', 'context_selection')})

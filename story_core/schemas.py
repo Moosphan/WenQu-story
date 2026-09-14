@@ -20,6 +20,11 @@ CHARACTER = obj({k: S for k in ("name", "desire", "fear", "boundary", "voice")})
 CHAPTER = obj({"number": {"type": "integer", "minimum": 1}, **{k:S for k in ("title", "goal", "conflict", "change", "payoff", "emotion")},
                "participants": {"type": "array", "items": S, "maxItems": 12, "uniqueItems": True}, "pov": S},
               ["number", "title", "goal", "conflict", "change", "payoff", "emotion"])
+# Optional explicit dependencies for trusted normalized-state integrations.
+# No model-produced assertion is automatically marked verified.
+for field in ('entity_ids', 'required_fact_ids', 'promise_ids', 'trigger_keys'):
+    CHAPTER['properties'][field] = {'type': 'array', 'items': S, 'uniqueItems': True}
+CHAPTER['properties']['story_time'] = {'type': 'number', 'description': '显式故事时间坐标；倒叙时不能用章节号替代。'}
 PROMISE = obj({"key": S, "setup_chapter": {"type": "integer", "minimum": 1}, "due_chapter": {"type": "integer", "minimum": 1}, "resolution": S, "mandatory": {"type": "boolean"}})
 MEMORY = obj({"kind": {"enum": ["fact", "entity", "relationship", "knowledge", "promise", "emotion", "timeline", "summary"]},
               "key": S, "value": S, "evidence": S, "visibility": {"enum": ["author", "reader"]},
