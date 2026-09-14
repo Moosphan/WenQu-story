@@ -68,8 +68,24 @@ def test_saved_claude_model_is_reused_by_host_provider(tmp_path, monkeypatch):
     captured = {}
 
     class FakeClaude:
-        def __init__(self, model=None): captured['model'] = model
+        def __init__(self, model=None, host_options=None): captured['model'] = model
 
     monkeypatch.setattr(host, 'ClaudeCode', FakeClaude)
     configured_provider(settings=settings)
     assert captured['model'] == 'deepseek-v4-pro'
+
+
+def test_host_transport_survives_reload_and_ui_resave(tmp_path, monkeypatch):
+    from story_core.providers import configured_provider
+    monkeypatch.setattr('story_core.host.shutil.which', lambda _: '/usr/bin/claude')
+    settings = AISettings(tmp_path / 'ai.json', Vault())
+    options = {'transport': 'native_deepseek', 'thinking': 'off', 'revision_model': 'deepseek-v4-flash', 'auxiliary_model': 'deepseek-v4-flash'}
+    settings.save('claude_code', model='deepseek-v4-pro', host_options=options)
+    reloaded = AISettings(settings.path, Vault())
+    reloaded.save('claude_code', model='deepseek-v4-pro')
+    provider = configured_provider(settings=reloaded)
+    assert provider.native_transport == 'native_deepseek'
+    assert provider.thinking == 'off'
+    assert provider.revision_model == 'deepseek-v4-flash'
+    assert provider.auxiliary_model == 'deepseek-v4-flash'
+    assert reloaded.public()['host_options'] == options

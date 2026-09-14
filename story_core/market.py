@@ -1,15 +1,30 @@
 """Public, source-attributed rank-page snapshots. No login or protected API access."""
 import json
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
 
 from .errors import StoryError
 
 FANQIE_RANK_URL = 'https://fanqienovel.com/rank/'
 SOURCES = {
-    'fanqie_rank': {'label': '番茄小说排行榜', 'url': FANQIE_RANK_URL, 'status': 'available'},
-    'qidian_rank': {'label': '起点中文网排行榜', 'url': 'https://www.qidian.com/rank/', 'status': 'adapter_unavailable'},
+    'fanqie_rank': {'label': '番茄 · 古风世情阅读榜', 'url': 'https://fanqienovel.com/rank/0_2_1139', 'status': 'available'},
+    'fanqie_male': {'label': '番茄 · 西方奇幻阅读榜', 'url': 'https://fanqienovel.com/rank/1_2_1141', 'status': 'available'},
+    'fanqie_female_new': {'label': '番茄 · 古风世情新书榜', 'url': 'https://fanqienovel.com/rank/0_1_1139', 'status': 'available'},
+    'fanqie_male_new': {'label': '番茄 · 西方奇幻新书榜', 'url': 'https://fanqienovel.com/rank/1_1_1141', 'status': 'available'},
+    'qidian_rank': {'label': '起点 · 排行榜', 'url': 'https://www.qidian.com/rank/', 'status': 'available'},
 }
+
+# Category identifiers are taken from the public rank page's own links.
+for gender, category, label in [('1', '1140', '东方仙侠'), ('1', '257', '玄幻脑洞'),
+                                 ('1', '261', '都市日常'), ('1', '539', '悬疑脑洞'),
+                                 ('0', '267', '现言脑洞'), ('0', '23', '种田'), ('0', '24', '快穿')]:
+    for rank_type, suffix in [('2', '阅读榜'), ('1', '新书榜')]:
+        source_id = f'fanqie_{gender}_{rank_type}_{category}'
+        SOURCES[source_id] = {'label': f'番茄 · {label}{suffix}',
+                              'url': f'https://fanqienovel.com/rank/{gender}_{rank_type}_{category}', 'status': 'available'}
 
 # These words are only labels for visible public title/summary text. They are not
 # a classifier, a platform taxonomy, or a claim about reader demand.
@@ -95,19 +110,42 @@ def _assignment_json(html, marker='window.__INITIAL_STATE__='):
             depth -= 1
             if depth == 0:
                 try:
-                    return json.loads(html[start:position + 1])
+                    payload = html[start:position + 1]
+                    # Public SSR state is a JS literal: optional fields may be
+                    # undefined. Normalize tokens only, never text inside strings.
+                    payload = re.sub(r'"(?:\\.|[^"\\])*"|\bundefined\b',
+                                     lambda match: 'null' if match.group() == 'undefined' else match.group(), payload)
+                    return json.loads(payload)
                 except json.JSONDecodeError as error:
                     raise StoryError('MARKET_PARSE_FAILED', '公开榜单状态不是有效 JSON。') from error
     raise StoryError('MARKET_PARSE_FAILED', '公开榜单状态不完整。')
 
 
-def parse_fanqie_rank(html):
+def parse_fanqie_rank(html, detail_get=None):
     state = _assignment_json(html)
     books = state.get('rank', {}).get('book_list')
     if not isinstance(books, list) or not books:
         raise StoryError('MARKET_PARSE_FAILED', '公开榜单没有可验证的作品条目。')
     items = []
-    for row in books[:50]:
+    def enrich(row):
+        row = dict(row)
+        if any('\ue000' <= c <= '\uf8ff' for c in str(row.get('bookName', '')) + str(row.get('abstract', ''))):
+            if not detail_get:
+                raise StoryError('MARKET_PARSE_FAILED', '榜单文字需要从公开书籍详情页补全。')
+            book_id = str(row.get('bookId', ''))
+            if not book_id.isdigit():
+                raise StoryError('MARKET_PARSE_FAILED', '书籍 ID 无效。')
+            detail = _assignment_json(detail_get('https://fanqienovel.com/page/' + book_id)).get('page', {})
+            if str(detail.get('bookId')) != book_id:
+                raise StoryError('MARKET_PARSE_FAILED', '详情页与榜单书籍 ID 不一致。')
+            for field in ('bookName', 'abstract', 'author'):
+                row[field] = detail.get(field, row.get(field, ''))
+            if any('\ue000' <= c <= '\uf8ff' for c in str(row.get('bookName', '')) + str(row.get('abstract', ''))):
+                raise StoryError('MARKET_PARSE_FAILED', '详情页仍有无法识别的字体编码。')
+        return row
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        resolved = list(pool.map(enrich, [r for r in books[:20] if isinstance(r, dict)]))
+    for row in resolved:
         if not isinstance(row, dict) or not isinstance(row.get('bookName'), str) or not row['bookName'].strip():
             continue
         rank = row.get('currentPos')
@@ -116,6 +154,7 @@ def parse_fanqie_rank(html):
         if any('\ue000' <= char <= '\uf8ff' for char in row['bookName']):
             raise StoryError('MARKET_PARSE_FAILED', '公开榜单以自定义字体编码作品名，当前适配器无法可靠还原标题。')
         items.append({'rank': rank, 'title': row['bookName'].strip(), 'author': str(row.get('author') or '').strip(),
+                      'url': 'https://fanqienovel.com/page/' + str(row.get('bookId') or ''),
                       'summary': str(row.get('abstract') or '').strip()[:600], 'word_count': str(row.get('wordNumber') or ''),
                       'read_count': str(row.get('read_count') or row.get('readCount') or ''), 'source_item_id': str(row.get('bookId') or '')})
     if not items:
@@ -123,17 +162,27 @@ def parse_fanqie_rank(html):
     return sorted(items, key=lambda item: item['rank'])
 
 
-def fetch_fanqie_rank(http_get=None):
+def fetch_fanqie_rank(http_get=None, source_id='fanqie_rank'):
     getter = http_get or _http_get
-    return parse_fanqie_rank(getter(FANQIE_RANK_URL))
+    return parse_fanqie_rank(getter(SOURCES[source_id]['url']), getter)
+
+
+def fetch_qidian_rank(http_get=None):
+    html = (http_get or _http_get)(SOURCES['qidian_rank']['url'])
+    if 'probe.js' in html or 'captcha' in html.lower():
+        raise StoryError('MARKET_BLOCKED', '起点返回浏览器验证页；请在官方页面查看，当前未获取到榜单。')
+    raise StoryError('MARKET_PARSE_FAILED', '起点页面暂未匹配到可验证的榜单结构，请在官方页面查看。')
 
 
 def _http_get(url):
     request = Request(url, headers={'User-Agent': 'HulkStoryResearch/0.1 (+local author workspace)'})
-    with urlopen(request, timeout=15) as response:
-        if response.status != 200:
-            raise StoryError('MARKET_FETCH_FAILED', f'公开榜单返回 HTTP {response.status}。')
-        return response.read().decode('utf-8', errors='replace')
+    try:
+        with urlopen(request, timeout=8) as response:
+            if response.status != 200:
+                raise StoryError('MARKET_FETCH_FAILED', f'平台返回 HTTP {response.status}，未获取榜单；可能要求浏览器验证。')
+            return response.read(5_000_000).decode('utf-8', errors='replace')
+    except (URLError, TimeoutError) as error:
+        raise StoryError('MARKET_FETCH_FAILED', f'榜单请求失败（{type(error).__name__}），请稍后刷新。') from None
 
 
 def unavailable_snapshot(source_id):

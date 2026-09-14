@@ -36,7 +36,7 @@ const state={book:{book_id:'b'},worker:true};const stages={draft:'写作正文'}
 const fields={'budget-tokens':{value:'',focus(){},closest(){return {}; }},'max-steps':{value:''}};
 const element=id=>fields[id];let requests=[];let messages=[];
 let status={run:{status:'paused',stage:'draft',chapter_number:4,budget_tokens:20000000,max_steps:500}};
-const api=async(path,body)=>{if(body) requests.push([path,body]);return status;};
+const api=async(path,body)=>{if(path==='/api/capabilities') return {worker_configured:true,api_configured:true,executor:'fake'};if(body) requests.push([path,body]);return status;};
 const workflowPresentation=()=>({notice:'续写'});const needsAuthorRevision=()=>false;
 const notice=m=>messages.push(m);const refreshStatus=async()=>{};
 ''' + helper + handler + r'''

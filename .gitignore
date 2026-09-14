@@ -43,3 +43,6 @@ docs/*
 !docs/14-edge-tts-player.md
 !docs/15-wenqu-brand-and-trash.md
 !docs/open-source-release.md
+
+!docs/16-market-research-rebuild.md
+!docs/17-bounded-context-memory-architecture.md

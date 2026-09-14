@@ -172,6 +172,7 @@ function renderSelectedChapter() {
 function controls() {
   const run = state.status?.run; const active = run && ['running', 'paused', 'needs_attention'].includes(run.status); const archived = state.book?.book_kind === 'archived';
   const revisionUnlocked = !active || needsAuthorRevision(run);
+  element('get-task').hidden = Boolean(state.worker);
   const conditions = { continue: !state.book || archived || state.status?.status === 'complete' || state.status?.worker_running, pause: !active || run.status === 'paused', cancel: !active, export: state.status?.status !== 'complete', 'save-revision': !state.chapter || !state.dirty || !revisionUnlocked, 'request-revision': !state.chapter || !revisionUnlocked, 'get-task': !active || run.status !== 'running', 'submit-task': !state.task?.task_id, 'submit-human-feedback': !state.chapter || state.chapter.status !== 'committed', 'import-chapters': Boolean(active) || archived, 'edit-story-bible': !state.book?.brief || !state.book?.plan };
   for (const [id, disabled] of Object.entries(conditions)) element(id).disabled = disabled || state.busy.has(id);
   element('revision-feedback').disabled = !revisionUnlocked;
@@ -704,6 +705,11 @@ function renderExecutionSummary() {
     return;
   }
   const blocker = state.status?.blocker;
+  if (blocker?.code === 'CONTEXT_LIMIT') {
+    box.classList.add('is-failed'); title.textContent = `尚未启动：第 ${blocker.chapter_number} 章 · ${stages[blocker.stage]}`;
+    detail.textContent = `本地上下文检查拦截，尚未调用模型。当前请求 ${(blocker.input_bytes / 1024).toFixed(1)} KB，上限 ${(blocker.limit_bytes / 1024).toFixed(1)} KB。已保存正文和记忆均保留；这不是上一任务失败，也不是 Token 预算不足。`;
+    return;
+  }
   if (blocker?.code === 'BUDGET_LIMIT') {
     box.classList.add('is-failed'); title.textContent = `尚未启动：第 ${blocker.chapter_number} 章 · ${stages[blocker.stage]}`;
     detail.textContent = `本轮预算已拦截下一任务，未调用模型。累计预留 ${blocker.reserved_tokens.toLocaleString()} / ${blocker.budget_tokens.toLocaleString()} Token；下一步需预留 ${blocker.next_reservation.toLocaleString()} Token。步骤 ${blocker.steps} / ${blocker.max_steps}。请调整预算后继续，已完成章节不受影响。`;
@@ -856,8 +862,11 @@ async function refreshStatus() {
 }
 async function continueWriting() {
   if (!state.book) return;
+  const capabilities = await api('/api/capabilities');
+  state.api = capabilities.api_configured; state.worker = capabilities.worker_configured; state.executor = capabilities.executor;
+  if (!state.worker) { notice(capabilities.configuration_error?.message || '尚未配置自动执行器，请在 AI 配置中选择本机 Claude Code 或 API。配置后点击继续写作即可自动推进。'); openAISettings(); return; }
   const bookId = state.book.book_id; const status = await api(`/api/books/${bookId}/status`); const run = status.run; const presentation = workflowPresentation(status);
-  if (status.active_task && !status.worker_running) {
+  if (status.active_task && status.active_task.worker_id !== 'gui' && !status.worker_running) {
     notice(`第 ${status.active_task.chapter_number} 章 · ${stages[status.active_task.stage]} 已由宿主领取，等待提交。租约到期时间：${new Date(status.active_task.lease_until * 1000).toLocaleTimeString()}。`);
     await refreshStatus(); return;
   }
@@ -876,7 +885,7 @@ async function continueWriting() {
     await api(`/api/books/${bookId}/control`, { action: 'start', options });
   } else if (run.status !== 'running') await api(`/api/books/${bookId}/control`, { action: 'resume', options });
   if (state.worker) { await api(`/api/books/${bookId}/worker`, {}); notice(presentation.notice); }
-  else notice('任务已就绪。请在接入本书库的宿主 Agent 中接续，或在“预算与宿主接续”中领取任务。');
+  else notice('自动执行器未配置，请打开 AI 配置。');
   await refreshStatus();
 }
 function automaticRevisionFeedback() {
@@ -994,35 +1003,56 @@ async function generateOpeningIdeas(button) {
   await pollIdeaJob(job.job_id);
 }
 async function loadMarket() {
-  const box = element('market-sources'); box.replaceChildren();
+  const box = element('market-sources'); box.replaceChildren(node('p', '正在加载榜单目录…', 'hint'));
   const response = await api('/api/market/sources');
-  for (const source of response.sources) {
-    const card = node('section', undefined, 'market-source'); const header = node('header');
-    const label = node('strong', source.label); const refresh = node('button', source.status === 'adapter_unavailable' ? '暂不可用' : '刷新快照');
-    refresh.disabled = source.status === 'adapter_unavailable'; header.append(label, refresh); card.append(header);
-    const detail = node('p', source.status === 'adapter_unavailable' ? '该来源目前触发浏览器验证，暂不抓取，也不会显示伪造榜单。' : '正在读取最近一次公开页面快照。'); card.append(detail);
-    const link = node('a', '打开公开来源 ↗'); link.href = source.url; link.target = '_blank'; link.rel = 'noreferrer'; card.append(link);
-    if (source.status !== 'adapter_unavailable') {
-      const render = async refreshNow => {
-        try {
-          const snapshot = await api(refreshNow ? `/api/market/${source.source_id}/refresh` : `/api/market/${source.source_id}`, refreshNow ? {} : undefined);
-          detail.textContent = `${snapshot.status === 'fresh' ? '已更新' : snapshot.status === 'stale' ? '显示上次有效快照' : '当前不可用'} · ${new Date(snapshot.collected_at * 1000).toLocaleString()}${snapshot.error ? ` · ${snapshot.error}` : ''}`;
-          const old = card.querySelector('ol'); if (old) old.remove();
-          if (snapshot.items?.length) { const list = node('ol'); for (const item of snapshot.items.slice(0, 8)) list.append(node('li', `${item.title} · ${item.author || '作者未知'} · 第 ${item.rank} 名`)); card.append(list); }
-          const oldSignals = card.querySelector('.market-signals'); if (oldSignals) oldSignals.remove();
-          if (snapshot.signals?.length) {
-            if (!state.marketSelectionInitialized) state.marketSources.add(source.source_id);
-            const signals = node('div', undefined, 'market-signals'); signals.append(node('span', '可验证观察词'));
-            for (const signal of snapshot.signals.slice(0, 10)) { const chip = node('button', `${signal.label} · ${signal.count}`); chip.type = 'button'; chip.title = `${signal.observation}：${signal.source_item_ids.join('、')}`; chip.addEventListener('click', () => addMarketSignal(signal.label)); signals.append(chip); }
-            const toggle = node('button', state.marketSources.has(source.source_id) ? '已纳入灵感' : '纳入灵感', `source-toggle ${state.marketSources.has(source.source_id) ? 'selected' : ''}`); toggle.type = 'button'; toggle.setAttribute('aria-pressed', String(state.marketSources.has(source.source_id))); toggle.addEventListener('click', () => toggleMarketSource(source.source_id, toggle)); signals.append(toggle); card.append(signals); updateMarketSelection();
-          }
-        } catch (error) { detail.textContent = error.message; }
-      };
-      refresh.addEventListener('click', () => render(true)); await render(false);
-    }
-    box.append(card);
-  }
-  state.marketSelectionInitialized = true; updateMarketSelection();
+  const layout = node('div', undefined, 'market-browser');
+  const navigation = node('nav', undefined, 'market-navigation'); navigation.setAttribute('aria-label', '选择榜单');
+  const content = node('section', undefined, 'market-results'); layout.append(navigation, content); box.replaceChildren(layout);
+  let generation = 0;
+  const load = async (source, refreshNow = false) => {
+    const ticket = ++generation;
+    navigation.querySelectorAll('button').forEach(b => { b.classList.toggle('selected', b.dataset.source === source.source_id); b.setAttribute('aria-pressed', String(b.dataset.source === source.source_id)); });
+    const header = node('header', undefined, 'market-results-header'); header.append(node('h3', source.label));
+    const refresh = node('button', '更新榜单', 'small'); refresh.disabled = true; header.append(refresh);
+    const status = node('p', '正在读取榜单并核对书名，首次加载可能需要数十秒…', 'hint');
+    content.replaceChildren(header, status);
+    refresh.addEventListener('click', () => load(source, true));
+    try {
+      const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 90000);
+      let snapshot;
+      try {
+        const r = await fetch(`/api/market/${source.source_id}${refreshNow ? '/refresh' : ''}`, {signal:controller.signal, ...(refreshNow ? {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'} : {})});
+        snapshot = await r.json(); if (!r.ok) throw new Error(snapshot.detail?.message || '榜单请求失败');
+      } finally { clearTimeout(timer); }
+      if (ticket !== generation) return;
+      status.textContent = `${snapshot.items.length} 本 · ${snapshot.status === 'fresh' ? '采集于' : snapshot.status === 'stale' ? '旧快照采集于' : '尝试于'} ${new Date(snapshot.collected_at * 1000).toLocaleString()}${snapshot.error ? ' · '+snapshot.error : ''}`;
+      const link = node('a','官方榜单 ↗'); link.href=source.url; link.target='_blank'; link.rel='noreferrer'; header.append(link);
+      if (!snapshot.items.length) { content.append(node('p', '当前没有获取到书籍。可打开官方榜单查看，或切换其他榜单。', 'market-empty')); return; }
+      const tools = node('div',undefined,'market-result-tools');
+      const search = node('input'); search.placeholder='搜索书名、作者或简介'; search.setAttribute('aria-label','搜索榜单书籍');
+      const use = node('button',state.marketSources.has(source.source_id)?'已纳入选题':'纳入选题', 'small');
+      use.addEventListener('click',()=>{toggleMarketSource(source.source_id,use);use.textContent=state.marketSources.has(source.source_id)?'已纳入选题':'纳入选题';});
+      tools.append(search,use);content.append(tools);
+      const signals=node('div',undefined,'market-signals');
+      for(const signal of snapshot.signals.slice(0,10)){const chip=node('button',`${signal.label} · ${signal.count}`,'small');chip.title='仅统计本榜标题与简介中的出现次数';chip.addEventListener('click',()=>addMarketSignal(signal.label));signals.append(chip);}
+      content.append(signals);
+      const list=node('div',undefined,'market-book-list');content.append(list);
+      const render=()=>{
+        list.replaceChildren();const query=search.value.trim().toLowerCase();
+        for(const book of snapshot.items.filter(b=>`${b.title} ${b.author} ${b.summary}`.toLowerCase().includes(query))){
+          const row=node('article',undefined,'market-book');row.append(node('span',String(book.rank).padStart(2,'0'),'market-rank'));
+          const info=node('div');const title=node('a',book.title);title.href=book.url || source.url;title.target='_blank';title.rel='noreferrer';info.append(title);
+          info.append(node('p',`${book.author || '作者未提供'} · ${book.word_count ? Number(book.word_count).toLocaleString()+' 字' : '字数未提供'}${book.read_count ? ' · '+Number(book.read_count).toLocaleString()+' 在读' : ''}`,'hint'));
+          const detail=node('details');detail.append(node('summary','查看简介'),node('p',book.summary || '来源未提供简介'));info.append(detail);row.append(info);list.append(row);
+        }
+        if(!list.children.length)list.append(node('p','没有符合搜索条件的作品。','hint'));
+      };search.addEventListener('input',render);render();
+    } catch(error) {if(ticket===generation)status.textContent=error.name==='AbortError'?'榜单读取超时，请稍后重试。':error.message;}
+    finally {refresh.disabled=false;}
+  };
+  for(const source of response.sources){const button=node('button',source.label);button.dataset.source=source.source_id;button.addEventListener('click',()=>load(source));navigation.append(button);}
+  if(response.sources.length)await load(response.sources[0]);
+  updateMarketSelection();
 }
 function modelPickerOptions(providerId, selected = '') {
   const provider = state.aiConfig?.providers?.find(item => item.id === providerId);
@@ -1046,6 +1076,7 @@ function applyAIProvider(providerId, preserve = false) {
     element('ai-claude-note').textContent = `已发现本机 Claude Code 模型：${local}。可选择或手填模型；登录和密钥仍由 Claude Code 本机配置管理。`;
     if (!element('ai-model').value) { element('ai-model').value = local; modelPickerOptions(providerId, local); }
   }
+  if (isClaude && state.aiConfig?.host_options?.transport === 'native_deepseek') element('ai-claude-note').textContent += ' 当前使用 DeepSeek 原生 JSON 接口（复用本机连接），思考模式：' + (state.aiConfig.host_options.thinking === 'off' ? '关闭' : '默认') + '；连接参数已持久保存。';
   element('ai-api-key').value = '';
   element('ai-key-state').textContent = isClaude ? '本机登录' : state.aiConfig?.provider === providerId && state.aiConfig?.key_configured ? '已保存于系统钥匙串' : '尚未保存';
 }
@@ -1067,6 +1098,7 @@ async function loadAIConfig() {
 function openAISettings() { loadAIConfig().then(() => openDialog('ai-config-dialog')).catch(error => notice(error.message)); }
 
 function bind() {
+  for (const view of ['ranks','ideas']) action(`market-tab-${view}`, () => { element('market-sources').hidden = view !== 'ranks'; element('market-ideas-panel').hidden = view !== 'ideas'; for (const name of ['ranks','ideas']) element(`market-tab-${name}`).classList.toggle('selected', name === view); });
   document.addEventListener('pointerdown', event => closeShelfMenus(event.target.closest?.('.shelf-menu')));
   document.addEventListener('keydown', event => { if (event.key === 'Escape') closeShelfMenus(null, true); });
   action('open-trash', showTrash); action('home-trash', showTrash); action('close-trash', () => closeDialog('trash-dialog'));
@@ -1102,9 +1134,9 @@ function bind() {
     state.busy.add(button.id); controls(); notice('');
     try {
       const payload = storyBiblePayload(); const bookId = state.book.book_id;
-      await api(`/api/books/${bookId}/story-bible`, { ...payload, expected_revision: state.book.revision });
+      const saved = await api(`/api/books/${bookId}/story-bible`, { ...payload, expected_revision: state.book.revision });
       closeDialog('story-bible-dialog'); state.task = null; renderContextInspector(null);
-      await selectBook(bookId); notice('故事约定与章节骨架已保存。旧任务已停止，请基于新骨架继续写作。');
+      await selectBook(bookId); const renames = Object.entries(saved.renamed_characters || {}).map(([oldName, newName]) => `${oldName} → ${newName}`).join('、'); notice(renames ? `已同步改名：${renames}。更新 ${saved.renamed_chapters} 章正文、记忆与续写资料，历史版本保留。请继续写作。` : '故事约定与章节骨架已保存。旧任务已停止，请基于新骨架继续写作。');
     } catch (error) { notice(error.message); }
     finally { state.busy.delete(button.id); controls(); }
   });
@@ -1234,7 +1266,7 @@ function bind() {
     try { const role = element('query-role').value; const result = await api(`/api/books/${bookId}/query`, { query: element('query').value, role, through_chapter: role === 'reader' ? Number(element('query-boundary').value) : null }); if (bookId !== state.book?.book_id) return; element('hits').replaceChildren(); element('hits').className = ''; if (!result.hits.length) empty(element('hits'), '还没有相关的正式记忆', '试试别的关键词，或先完成当前正文的审查。'); for (const hit of result.hits) { const row = node('div', undefined, 'hit'); row.append(node('small', `第 ${hit.chapter_number} 章 · ${hit.kind} · 有原文证据`), node('p', hit.text), node('blockquote', hit.source.quote)); element('hits').append(row); } }
     catch (error) { notice(error.message); } finally { button.disabled = false; }
   });
-  action('get-task', async () => { state.task = await api(`/api/books/${state.book.book_id}/next`, {}); renderContextInspector(); element('task').textContent = display(state.task); });
+  action('get-task', async () => { if (state.worker) { await continueWriting(); return; } state.task = await api(`/api/books/${state.book.book_id}/next`, {}); renderContextInspector(); element('task').textContent = display(state.task); });
   action('submit-task', async () => { if (!state.task?.task_id) throw new Error('请先领取任务。'); await api('/api/tasks/submit', { task_id: state.task.task_id, lease_id: state.task.lease_id, worker_id: 'gui', result: JSON.parse(element('task-result').value) }); state.task = null; renderContextInspector(null); element('task-result').value = ''; element('task').textContent = '已提交。'; await refreshStatus(); });
   window.addEventListener('beforeunload', event => { if (state.dirty) { event.preventDefault(); event.returnValue = ''; } });
   renderGenreLibrary();

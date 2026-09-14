@@ -35,8 +35,13 @@ class WorkbenchRuntime:
             run = self.service._latest_run(conn, book_id)
             if not run or run['status'] != 'running':
                 raise StoryError('NO_ACTIVE_RUN', '请先开始或恢复本轮写作。')
-            task = conn.execute("SELECT worker_id,lease_until FROM tasks WHERE run_id=? AND status='leased' AND lease_until>?", (run['run_id'], now)).fetchone()
-            if task:
+            task = conn.execute("SELECT id,worker_id,lease_until FROM tasks WHERE run_id=? AND status='leased' AND lease_until>?", (run['run_id'], now)).fetchone()
+            if task and task['worker_id'] == 'gui':
+                # GUI preview/JSON checkout is not an executing external agent.
+                # Fence the old lease before the user-started worker takes over.
+                conn.execute("UPDATE tasks SET status='cancelled' WHERE id=?", (task['id'],))
+                self.store.event(conn, book_id, 'gui_task_handed_off', {'task_id': task['id']}, run['run_id'])
+            elif task:
                 raise StoryError('TASK_BUSY', '当前任务已由其他宿主领取，等待其提交或租约到期后再继续。',
                                  {'worker_id': task['worker_id'], 'lease_until': task['lease_until']})
             session = {'id': uid('web'), 'book_id': book_id, 'run_id': run['run_id'], 'executor': executor}

@@ -112,6 +112,7 @@ class ProposalRequest(StrictModel):
 
 class AIConfigRequest(StrictModel):
     provider: str
+    host_options: dict | None = None
     base_url: str = Field(default='', max_length=500)
     model: str = Field(default='', max_length=160)
     api_key: str = Field(default='', max_length=4096)

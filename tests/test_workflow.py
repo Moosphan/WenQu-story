@@ -187,7 +187,7 @@ def test_author_task_uses_required_and_supplementary_context_layers(tmp_path):
     assert task['stage'] == 'draft' and task['chapter_number'] == 2
     data = task['input']
     assert [memory['key'] for memory in data['required_memory']] == ['收音机']
-    assert data['canonical_memory'] == data['required_memory']
+    assert 'canonical_memory' not in data  # Never serialize the required layer twice.
     assert data['supplementary_memory'] == []
     source = next(item for item in data['context_manifest']['canonical_sources'] if item['key'] == '收音机')
     assert source['tier'] == 'required'

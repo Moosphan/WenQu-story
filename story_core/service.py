@@ -6,6 +6,7 @@ import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from .model_context import model_input
 from .errors import StoryError
 from .result_boundary import validate_output
 from .targeted_revision import materialize
@@ -196,22 +197,23 @@ class StoryService:
         return [{**{'source_id': source_id}, **source, 'last_collected_at': latest.get(source_id)} for source_id, source in SOURCES.items()]
 
     def market_snapshot(self, source_id, refresh=False, http_get=None):
-        from .market import SOURCES, derive_signals, fetch_fanqie_rank, unavailable_snapshot
+        from .market import SOURCES, derive_signals, fetch_fanqie_rank, fetch_qidian_rank
         if source_id not in SOURCES or type(refresh) is not bool:
             raise StoryError('INVALID_REQUEST', '市场来源或刷新参数无效。')
         with self.store.read() as conn:
             row = conn.execute('SELECT snapshot FROM market_snapshots WHERE source_id=? ORDER BY created_at DESC LIMIT 1', (source_id,)).fetchone()
         cached = json.loads(row['snapshot']) if row else None
-        if cached and not refresh:
+        if cached and cached.get('source_url') != SOURCES[source_id]['url']:
+            cached = None
+        if cached and not refresh and time.time() - cached['collected_at'] < 1800:
             return cached
-        if source_id == 'qidian_rank':
-            return unavailable_snapshot(source_id)
         try:
-            items = fetch_fanqie_rank(http_get)
+            items = fetch_qidian_rank(http_get) if source_id == 'qidian_rank' else fetch_fanqie_rank(http_get, source_id)
         except StoryError as error:
             if cached:
                 return {**cached, 'status': 'stale', 'error': error.message}
-            raise
+            return {'source_id': source_id, 'label': SOURCES[source_id]['label'], 'source_url': SOURCES[source_id]['url'],
+                    'status': 'unavailable', 'collected_at': time.time(), 'items': [], 'signals': [], 'error': error.message}
         source = SOURCES[source_id]
         snapshot = {'source_id': source_id, 'label': source['label'], 'source_url': source['url'], 'status': 'fresh',
                     'collected_at': time.time(), 'items': items, 'signals': derive_signals(items), 'error': None, 'parser_version': 1}
@@ -358,6 +360,54 @@ class StoryService:
             revision = conn.execute('SELECT revision FROM books WHERE id=?', (book_id,)).fetchone()[0]
             return {'book_id': book_id, 'project': project, 'revision': revision}
 
+    def _rename_story_characters(self, conn, book, brief, plan):
+        """Rename current canon atomically; immutable text/task history is retained."""
+        import re
+        old_chars = (book.get('brief') or {}).get('characters', [])
+        new_chars = brief.get('characters', [])
+        old_names = {c['name'] for c in old_chars}
+        new_names = {c['name'] for c in new_chars}
+        removed = [c for c in old_chars if c['name'] not in new_names]
+        added = [c for c in new_chars if c['name'] not in old_names]
+        renames = {}
+        for old in removed:
+            matches = [c for c in added if all(c.get(k) == v for k, v in old.items() if k != 'name')]
+            if len(matches) == 1 and matches[0]['name'] not in renames.values():
+                renames[old['name']] = matches[0]['name']
+        if removed and added and len(renames) != len(removed):
+            raise StoryError('AMBIGUOUS_RENAME', '无法确定人物改名对应关系。请先仅修改人物姓名并保存，再调整其他人物设定。')
+        if not renames:
+            return brief, plan, {}, 0
+        names = set(renames) | set(renames.values())
+        pattern = re.compile('|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True)))
+        def replace(value):
+            if isinstance(value, str):
+                return pattern.sub(lambda m: renames.get(m.group(), m.group()), value)
+            if isinstance(value, list):
+                return [replace(v) for v in value]
+            if isinstance(value, dict):
+                return {k: replace(v) for k, v in value.items()}
+            return value
+        count = 0
+        for row in conn.execute('SELECT v.* FROM chapters c JOIN chapter_versions v ON c.version_id=v.id WHERE c.book_id=?', (book['book_id'],)).fetchall():
+            title, body = replace(row['title']), replace(row['body'])
+            # Even a chapter without a name mention may have named memory records.
+            version = uid('version')
+            conn.execute('INSERT INTO chapter_versions VALUES (?,?,?,?,?,?)', (version, book['book_id'], row['number'], title, body, time.time()))
+            conn.execute('UPDATE chapters SET version_id=? WHERE book_id=? AND number=?', (version, book['book_id'], row['number']))
+            for table, fields in [('memories', ('key', 'value', 'evidence', 'data')), ('chunks', ('text',))]:
+                for item in conn.execute(f'SELECT * FROM {table} WHERE book_id=? AND version_id=?', (book['book_id'], row['id'])).fetchall():
+                    values = [dumps(replace(json.loads(item[f]))) if f == 'data' else replace(item[f]) for f in fields]
+                    conn.execute(f"UPDATE {table} SET version_id=?," + ','.join(f'{f}=?' for f in fields) + ' WHERE id=? AND book_id=?', (version, *values, item['id'], book['book_id']))
+            self.store.event(conn, book['book_id'], 'character_rename_applied', {'chapter_number': row['number'], 'version_id': version, 'previous_version_id': row['id'], 'renames': renames})
+            count += 1
+        # Retain the current candidate under the new vocabulary, discard stale extraction.
+        run = self._latest_run(conn, book['book_id'])
+        if run and run.get('candidate'):
+            conn.execute('UPDATE runs SET candidate=?,extraction=NULL WHERE id=?', (dumps(replace(run['candidate'])), run['run_id']))
+        conn.execute('UPDATE books SET request=?,project=? WHERE id=?', (replace(book['request']), dumps(replace(book['project'])), book['book_id']))
+        return replace(brief), replace(plan), renames, count
+
     def update_story_bible(self, book_id, brief, plan, expected_revision=None):
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise StoryError('INVALID_REQUEST', '作品版本必须是非负整数。')
@@ -365,6 +415,7 @@ class StoryService:
             book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
             validate('brief', brief, book)
             validate('outline', plan, book)
+            brief, plan, renames, renamed_chapters = self._rename_story_characters(conn, book, brief, plan)
             run = self._latest_run(conn, book_id)
             if run and run['status'] in ('running', 'paused', 'needs_attention'):
                 conn.execute("UPDATE runs SET status='cancelled',reason='故事约定或章节骨架已由作者更新，需要使用新上下文重新开始。' WHERE id=?", (run['run_id'],))
@@ -374,6 +425,7 @@ class StoryService:
             self.store.event(conn, book_id, 'story_bible_updated', {'revision_from': book['revision'], 'cancelled_run': bool(run and run['status'] in ('running', 'paused', 'needs_attention'))})
             saved = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
             return {'book_id': book_id, 'title': saved['title'], 'brief': saved['brief'], 'plan': saved['plan'],
+                    'renamed_characters': renames, 'renamed_chapters': renamed_chapters,
                     'revision': saved['revision'], 'run_cancelled': bool(run and run['status'] in ('running', 'paused', 'needs_attention'))}
 
     def list_books(self, kind='all'):
@@ -581,12 +633,11 @@ class StoryService:
         memories = canonical_memory(conn,book['book_id'],memory_boundary)
         data['promise_obligations'] = promise_obligations(memories, book['plan'], number)
         layers = context_layers(memories, data['chapter_plan'] or {}, number)
-        # Preserve canonical_memory for existing hosts, but make it the non-evictable layer.
+        # Serialize the authoritative layer once; duplicate aliases inflate requests.
         data['required_memory'] = layers['required']
         data['supplementary_memory'] = layers['supplementary']
         data['context_queries'] = layers['queries']
         data['pov_context'] = layers['pov_guard']
-        data['canonical_memory'] = layers['required']
         data['recent_chapters'] = prior[-2:]
         data['context_manifest'] = _context_manifest(book, 'author', memory_boundary,
                                                       [*layers['required'], *layers['supplementary']], prior[-2:],
@@ -659,8 +710,13 @@ class StoryService:
                         data['length_feedback'] = {'task_id': previous['id'], 'count': failure['details'].get('count'), **length_requirement(book['settings']['target_words'])}
                         break
         if stage == 'revise' and candidate:
+            if previous and previous['status'] != 'submitted' and json.loads(previous['input']).get('candidate') == candidate:
+                data['revision_mode'] = 'full_body'
+                data['instruction'] = instruction('revise', revision_mode='full_body') + _author_material_instruction(book['project'])
             bounds = data['length_requirement']
             failed_count = data.get('length_feedback', {}).get('count')
+            if isinstance(failed_count, int) and failed_count > bounds['max']:
+                data['instruction'] += f"\n本次是超长返修纠正：上次实际 {failed_count} 字，超过上限 {bounds['max']}。本次以 {bounds['target']} 字为目标，删除重复铺垫和解释，保留本章事件、关键对话和结局，不新增场景。必须输出整章。上限不是写作目标。"
             if bounds['current_count'] < bounds['min'] or (isinstance(failed_count, int) and failed_count < bounds['min']):
                 data['revision_mode'] = 'expand_full_body'
                 data['expansion_requirement'] = {'source_words': bounds['current_count'],
@@ -695,10 +751,10 @@ class StoryService:
     def _task_spec(self, conn, book, run):
         data=self._input(conn,book,run)
         schema = adjudication_schema(data['review_adjudication']) if data.get('review_adjudication') else REPAIR_SCHEMA if data.get('extraction_repair') else review_source_schema(run['candidate']) if run['stage'] == 'continuity' else SCHEMAS[run['stage']]
-        if data.get('revision_mode') == 'expand_full_body':
+        if data.get('revision_mode') in ('expand_full_body', 'full_body'):
             schema = SCHEMAS['revise']['oneOf'][0]
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
-        reservation=len(dumps(data).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
+        reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
         return data, schema, reservation
 
     def next_task(self, book_id, worker_id='host'):
@@ -724,7 +780,7 @@ class StoryService:
             if run['steps']>=run['max_steps'] or run['tokens']+reservation>run['budget_tokens']:
                 self._attention(conn,run,'步骤或 token 预留预算不足；可提高预算后继续。')
                 return {'task_id':None,'status':'needs_attention','reason':'budget'}
-            if len(dumps(data).encode())>180000:
+            if len(dumps(model_input(data)).encode())>180000:
                 self._attention(conn,run,'上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。')
                 return {'task_id':None,'status':'needs_attention','reason':'context_limit'}
             if task:
@@ -1086,6 +1142,10 @@ class StoryService:
                            'reserved_tokens': run['tokens'], 'budget_tokens': run['budget_tokens'],
                            'next_reservation': reservation, 'minimum_budget_tokens': run['tokens'] + reservation,
                            'steps': run['steps'], 'max_steps': run['max_steps'], 'minimum_max_steps': run['steps'] + 1}
+            if run and run['status'] == 'needs_attention' and run.get('reason') == '上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。':
+                context, _, _ = self._task_spec(conn, book, run)
+                blocker = {'code': 'CONTEXT_LIMIT', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
+                           'input_bytes': len(dumps(model_input(context)).encode()), 'limit_bytes': 180000}
             token_usage = self._token_usage(conn, book_id)
             return {'book_id':book_id,'title':book['title'],'status':book['status'],'revision':book['revision'],
                     'chapters':counts,'target_chapters':book['settings']['chapter_count'],'run':run,'events':events,

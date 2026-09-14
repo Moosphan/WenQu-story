@@ -249,3 +249,17 @@ def test_http_does_not_claim_success_when_external_worker_owns_task(tmp_path, mo
         assert response.json()['detail']['code'] == 'TASK_BUSY'
         assert client.get(f'/api/books/{book}/status').json()['worker_running'] is False
     assert service.task_active(task['task_id'], task['lease_id'])
+
+
+def test_gui_manual_lease_hands_off_to_automatic_worker(tmp_path):
+    from story_core.runtime import WorkbenchRuntime
+    service, book = make(tmp_path)
+    manual = service.next_task(book, 'gui')
+    runtime = WorkbenchRuntime(service)
+    session = runtime.reserve(book, 'fake')
+    assert not service.task_active(manual['task_id'], manual['lease_id'])
+    automatic = service.next_task(book, session['id'])
+    assert automatic['stage'] == manual['stage']
+    assert automatic['task_id'] != manual['task_id']
+    with pytest.raises(StoryError):
+        service.submit_task(manual['task_id'], manual['lease_id'], result_for(manual), 'gui')
