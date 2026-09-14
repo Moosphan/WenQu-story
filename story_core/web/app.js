@@ -1,5 +1,6 @@
 const element = id => document.getElementById(id);
 const state = { book: null, chapter: null, task: null, api: false, executor: 'manual', worker: false, dirty: false, books: [], reviews: [], candidateVersions: [], facets: {}, memoryFacet: '全部', versions: [], status: null, selection: 0, polling: false, busy: new Set(), editRevision: null, marketSources: new Set(), marketSelectionInitialized: false, aiConfig: null, activeView: 'overview', reviewView: 'reviews', focused: false, tts: { request: 0, objectUrl: '', key: '', playing: false }, ttsVoices: [] };
+let memoryOffset = 0;
 const statuses = { awaiting_author: '等待作者确认', new: '新作品', imported: '导入待审', writing: '写作中', running: '进行中', paused: '已暂停', needs_attention: '需要处理', complete: '已完结', draft: '未完稿', batch_complete: '本轮完成', cancelled: '已结束' };
 const stages = { brief: '建立创作约定', outline: '规划全书', draft: '写作正文', extract: '提取故事记忆', continuity: '核对连续性', reader: '读者审稿', arc: '故事弧审校', revise: '修改候选稿', ending: '全书完结审查', human: '真人反馈' };
 const readerProfiles = { target_reader: '目标题材读者', logic_reader: '逻辑敏感读者' };
@@ -142,7 +143,7 @@ async function api(path, body) {
   try {
     const response = await fetch(path, { signal: controller.signal, ...(body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) });
     const result = await response.json();
-    if (!response.ok) throw new Error(typeof result.detail === 'object' ? result.detail.message || display(result.detail) : result.detail || '请求失败');
+    if (!response.ok) { const error = new Error(typeof result.detail === 'object' ? result.detail.message || display(result.detail) : result.detail || '请求失败'); error.code = result.detail?.code; throw error; }
     return result;
   } catch (error) {
     if (error.name === 'AbortError' || error instanceof TypeError) throw new Error('无法连接本地服务。请确认服务已启动，然后刷新重试。');
@@ -501,7 +502,68 @@ async function selectBook(bookId) {
   element('downloads').hidden = true; element('task').textContent = ''; element('task-result').value = ''; renderContextInspector(null);
   empty(element('hits'), '从一个细节开始检索', '只有已通过审查的正文与记忆参与检索。', '⌕');
   storage('setItem', 'hulk-book', bookId); element('onboarding').hidden = true; element('workspace').hidden = false;
-  switchTab(storage('getItem', `hulk-view-${bookId}`) || 'overview'); renderBook(); renderShelf(); await Promise.all([refreshStatus(), loadFacets()]);
+  switchTab(storage('getItem', `hulk-view-${bookId}`) || 'overview'); renderBook(); renderShelf(); memoryOffset = 0; await Promise.all([refreshStatus(), loadFacets(), loadMemoryReview()]);
+}
+async function loadMemoryReview() {
+  if (!state.book) return;
+  const bookId = state.book.book_id, offset = memoryOffset, filter = element('memory-review-filter').value;
+  const base = `/api/books/${bookId}/memory`;
+  const [proposals, maintenance] = await Promise.all([api(`${base}/proposals?status=${filter}&limit=20&offset=${offset}`), api(`${base}/maintenance?limit=5`)]);
+  if (state.book?.book_id !== bookId || offset !== memoryOffset || filter !== element('memory-review-filter').value) return;
+  const source = element('memory-source'), selected = source.value;
+  source.replaceChildren();
+  for (const chapter of state.book.chapters.filter(item => item.status === 'committed')) {
+    const option = node('option', `第 ${chapter.chapter_number} 章 · ${chapter.title}`); option.value = chapter.version_id; source.append(option);
+  }
+  if ([...source.options].some(option => option.value === selected)) source.value = selected;
+  const box = element('memory-proposals'); box.replaceChildren();
+  if (!proposals.items.length) box.append(node('p', '这一页没有记录。', 'hint'));
+  for (const proposal of proposals.items) {
+    const data = proposal.candidate || {}, row = node('article', undefined, 'hit');
+    row.append(node('strong', `${proposal.subject_display_name || data.subject_alias || data.subject_entity_id || '未绑定实体'} · ${data.predicate || '无法识别属性'}：${typeof data.value === 'string' ? data.value : JSON.stringify(data.value)}`));
+    row.append(node('small', `第 ${data.source_chapter || '?'} 章 · 故事时间 ${data.story_valid_from ?? '未指定'} · ${data.visibility === 'author' ? '仅作者' : '读者可见'} · ${proposal.source_current ? '来源版本有效' : '来源失效或待检查'}`), node('blockquote', data.evidence || '无有效证据'));
+    const scopeName = { objective: '客观状态', character_belief: '角色信念', author_plan: '作者计划' };
+    row.append(node('small', `${scopeName[data.scope || 'objective'] || data.scope}${data.owner_entity_id ? ` · 所属角色：${proposal.owner_display_name || data.owner_entity_id}` : ''}${data.story_valid_to != null ? ` · 有效至故事时间 ${data.story_valid_to}` : ''}${data.subject_entity_id ? ` · 实体 ${data.subject_entity_id}` : ''}`));
+    if (proposal.reason) row.append(node('p', `隔离原因：${proposal.reason}`, 'hint'));
+    const act = (label, suffix, payload) => {
+      const button = node('button', label); button.type = 'button';
+      const requestId = crypto.randomUUID();
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          await api(`${base}/proposals/${proposal.id}/${suffix}`, { ...payload(), expected_revision: proposals.revision, request_id: requestId });
+          if (state.book?.book_id === bookId) { await refreshStatus(); await loadMemoryReview(); }
+        } catch (error) { notice(error.message); button.disabled = false; }
+      });
+      row.append(button); return button;
+    };
+    if (proposal.status === 'pending' && proposal.source_current) {
+      if (!data.subject_entity_id) {
+        const select = node('select'); select.setAttribute('aria-label', '明确选择对应实体');
+        for (const identity of proposal.identity_candidates) { const option = node('option', `${identity.display_name} · ${identity.id}`); option.value = identity.id; select.append(option); }
+        row.append(select);
+        const binding = act('绑定所选实体', 'bind', () => ({ entity_id: select.value })); binding.disabled = !select.options.length;
+      } else {
+        const trusted = node('input'); trusted.type = 'checkbox';
+        const trustLabel = node('label', '我已核实原文与这条说法的含义', 'memory-check'); trustLabel.prepend(trusted); row.append(trustLabel);
+        const conflict = node('input'); conflict.type = 'checkbox';
+        if (proposal.conflicts.length) {
+          row.append(node('p', `当前状态存在不同说法：${proposal.conflicts.map(item => JSON.stringify(item.value)).join('；')}`, 'hint'));
+          const label = node('label', '确认这条新说法替代该时间的冲突状态', 'memory-check'); label.prepend(conflict); row.append(label);
+        }
+        const accept = act('接受事实', 'decision', () => ({ decision: 'accept', trust: trusted.checked, allow_conflict: conflict.checked }));
+        const enable = () => { accept.disabled = !trusted.checked || (proposal.conflicts.length > 0 && !conflict.checked); };
+        trusted.addEventListener('change', enable); conflict.addEventListener('change', enable); enable();
+      }
+    }
+    if (proposal.status === 'pending') act('拒绝这条说法', 'decision', () => ({ decision: 'reject' }));
+    box.append(row);
+  }
+  element('memory-page').textContent = `共 ${proposals.total} 条 · 第 ${Math.floor(offset / 20) + 1} 页`;
+  element('memory-previous').disabled = offset === 0;
+  element('memory-next').disabled = offset + 20 >= proposals.total;
+  const counts = maintenance.counts;
+  element('memory-maintenance-status').textContent = `待整理 ${counts.pending || 0} · 已整理 ${counts.ready || 0} · 仍待核实 ${counts.needs_verification || 0} · 已替换 ${counts.superseded || 0} · 失败 ${counts.failed || 0}`;
 }
 function renderMemoryFacets() {
   const box = element('memory-facets'); box.replaceChildren();
@@ -1257,6 +1319,31 @@ function bind() {
     const result = await api(`/api/books/${state.book.book_id}/import`, { chapters, expected_revision: state.book.revision }); closeDialog('import-dialog'); element('import-files').value = ''; await selectBook(state.book.book_id); notice(`已导入 ${result.imported} 章待审原稿，可开始逆向建档与逐章审查。`);
   });
   for (const id of ['export', 'export-partial']) action(id, async () => { const manifest = await api(`/api/books/${state.book.book_id}/export`, { allow_partial: id === 'export-partial' }); const box = element('downloads'); box.replaceChildren(); box.hidden = false; box.append(node('p', manifest.complete ? '成稿已准备好，EPUB 可用于阅读器预览；发布前请完成作者审阅。' : '草稿已导出，文件保留未完稿标记，不提供 EPUB。')); const available = new Set(manifest.files.map(file => file.name)); for (const filename of ['manuscript.txt', 'manuscript.md', 'book.epub', 'manifest.json']) { if (!available.has(filename)) continue; const link = node('a', filename); link.href = `/api/exports/${manifest.export_id}/${filename}`; link.download = filename; box.append(link); } });
+  action('memory-refresh', loadMemoryReview);
+  action('memory-previous', async () => { memoryOffset = Math.max(0, memoryOffset - 20); await loadMemoryReview(); });
+  action('memory-next', async () => { memoryOffset += 20; await loadMemoryReview(); });
+  element('memory-review-filter').addEventListener('change', () => { memoryOffset = 0; loadMemoryReview().catch(error => notice(error.message)); });
+  action('memory-maintain', async () => {
+    const bookId = state.book.book_id;
+    const result = await api(`/api/books/${bookId}/memory/maintenance`, { limit: 5, backfill: true });
+    if (state.book?.book_id === bookId) { await loadMemoryReview(); notice(`已处理 ${result.processed} 项，尚有 ${result.backfill_remaining} 章未加入整理队列。`); }
+  });
+  element('memory-proposal-form').addEventListener('submit', async event => {
+    event.preventDefault(); const button = event.submitter, bookId = state.book.book_id;
+    const source = state.book.chapters.find(item => item.version_id === element('memory-source').value && item.status === 'committed');
+    if (!source) { notice('请先选择一章有效定稿。'); return; }
+    const candidate = { subject_alias: element('memory-subject').value.trim(), predicate: element('memory-predicate').value, value: element('memory-value').value,
+      source_version: source.version_id, source_chapter: source.chapter_number, story_valid_from: Number(element('memory-time').value),
+      visibility: element('memory-visibility').value, evidence: element('memory-evidence').value };
+    button.disabled = true;
+    try {
+      try { await api(`/api/books/${bookId}/memory/entities`, { name: candidate.subject_alias }); }
+      catch (error) { if (error.code !== 'AMBIGUOUS_ENTITY') throw error; }
+      const result = await api(`/api/books/${bookId}/memory/proposals`, { candidates: [candidate], request_id: crypto.randomUUID() });
+      if (state.book?.book_id === bookId) { memoryOffset = 0; element('memory-review-filter').value = result.quarantined.length ? 'quarantined' : 'pending'; await loadMemoryReview(); }
+      notice(result.quarantined.length ? '来源或字段需要检查，已保留在隔离列表。' : '已加入待核实列表。');
+    } catch (error) { notice(error.message); } finally { button.disabled = false; }
+  });
   element('human-feedback-form').addEventListener('submit', async event => {
     event.preventDefault(); const form = event.currentTarget; const chapter = state.chapter; const bookId = state.book?.book_id;
     if (!chapter || chapter.status !== 'committed') { notice('请先选择已定稿章节。'); return; }
@@ -1281,7 +1368,7 @@ function bind() {
   });
   element('query-form').addEventListener('submit', async event => {
     event.preventDefault(); const bookId = state.book.book_id; const button = event.submitter; button.disabled = true;
-    try { const role = element('query-role').value; const result = await api(`/api/books/${bookId}/query`, { query: element('query').value, role, through_chapter: role === 'reader' ? Number(element('query-boundary').value) : null }); if (bookId !== state.book?.book_id) return; element('hits').replaceChildren(); element('hits').className = ''; if (!result.hits.length) empty(element('hits'), '还没有相关的正式记忆', '试试别的关键词，或先完成当前正文的审查。'); for (const hit of result.hits) { const row = node('div', undefined, 'hit'); row.append(node('small', `第 ${hit.chapter_number} 章 · ${hit.kind} · 有原文证据`), node('p', hit.text), node('blockquote', hit.source.quote)); element('hits').append(row); } }
+    try { const role = element('query-role').value; const result = await api(`/api/books/${bookId}/query`, { query: element('query').value, strategy: element('query-strategy').value, role, through_chapter: role === 'reader' ? Number(element('query-boundary').value) : null }); if (bookId !== state.book?.book_id) return; element('hits').replaceChildren(); element('hits').className = ''; if (result.index_complete === false) element('hits').append(node('p', '记忆索引尚未补齐；没有命中表示未知。可在下方运行本地整理。', 'hint')); if (!result.hits.length) element('hits').append(node('p', '未找到相关记忆；没有命中表示未知，可尝试其他关键词。', 'hint')); for (const hit of result.hits) { const row = node('div', undefined, 'hit'); row.append(node('small', `第 ${hit.chapter_number} 章 · ${hit.kind} · 有原文证据`), node('p', hit.text), node('blockquote', hit.source.quote)); element('hits').append(row); } }
     catch (error) { notice(error.message); } finally { button.disabled = false; }
   });
   action('get-task', async () => { if (state.worker) { await continueWriting(); return; } state.task = await api(`/api/books/${state.book.book_id}/next`, {}); renderContextInspector(); element('task').textContent = display(state.task); });

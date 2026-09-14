@@ -36,7 +36,7 @@ def test_schema_migration_is_additive_and_reopens_v7(world):
         chapter(conn, book, 1)
     reopened = Store(store.root)
     with reopened.read() as conn:
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 9
         assert conn.execute('SELECT count(*) FROM chapters').fetchone()[0] == 1
         assert conn.execute("SELECT name FROM sqlite_master WHERE name='lm_facts'").fetchone()
 

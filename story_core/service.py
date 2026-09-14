@@ -10,6 +10,8 @@ from pathlib import Path
 from .model_context import model_input
 from .context_compiler import ContextCompiler, ContextPolicy
 from .context_metrics import context_usage
+from .task_context import ContextActions, prepare_lookup
+from .memory_actions import MemoryActions
 from .errors import StoryError
 from .result_boundary import validate_output
 from .targeted_revision import materialize
@@ -177,7 +179,7 @@ def _task(row):
     return result
 
 
-class StoryService:
+class StoryService(ContextActions, MemoryActions):
     def __init__(self, root):
         self.store = Store(root)
 
@@ -705,7 +707,7 @@ class StoryService:
             if candidate:
                 data['length_requirement']['current_count'] = word_count(candidate['body'])
             data['instruction'] += '\n按 length_requirement.target 写足本章，不以 min 为写作目标。计数不含标点空白；返修后的完整正文（包括应用 patches 后）也须满足范围。原稿不足时，补足本章目标内的尝试、阻力、对话交锋、结果及情绪余波；不能靠重复解释、回顾或无关支线凑字数。删除有问题的说明后保留必要场景，不把去AI味理解为持续缩短正文。length_feedback 是上次实际校验结果，重试须结合它调整正文，不能重复提交同样的删改。'
-            previous = conn.execute("SELECT id,input,status FROM tasks WHERE book_id=? AND run_id=? AND chapter_number=? AND stage=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            previous = conn.execute("SELECT id,input,status FROM tasks WHERE book_id=? AND run_id=? AND chapter_number=? AND stage=? AND status!='lookup' ORDER BY created_at DESC,rowid DESC LIMIT 1",
                                     (book['book_id'], run['run_id'], number, stage)).fetchone()
             if previous and previous['status'] != 'submitted' and json.loads(previous['input']).get('candidate') == candidate:
                 for row in conn.execute("SELECT payload FROM events WHERE book_id=? AND kind IN ('task_result_rejected','worker_failed') ORDER BY seq DESC", (book['book_id'],)):
@@ -777,6 +779,7 @@ class StoryService:
             # Reader/extraction views intentionally lack author chapter_plan.
             # Keep only dependency IDs, never its future plot text.
             data['context_required_ids'] = [*plan.get('required_fact_ids', []), *plan.get('promise_ids', [])]
+        data, schema = prepare_lookup(conn, book, run, data, schema, policy)
         compiled = ContextCompiler(policy).compile(data, schema, stage=run['stage'])
         manifest = data.get('context_manifest')
         data = compiled.input
@@ -929,9 +932,10 @@ class StoryService:
         conn.execute('INSERT INTO chapter_versions VALUES (?,?,?,?,?,?)',(version,book['book_id'],number,candidate['title'],candidate['body'],time.time()))
         conn.execute("INSERT INTO chapters VALUES (?,?,?,'committed') ON CONFLICT(book_id,number) DO UPDATE SET version_id=excluded.version_id,status='committed'",(book['book_id'],number,version))
         index_chapter(conn,book['book_id'],number,version,candidate['body'],run['extraction']['memories'])
+        from .memory_workflow import enqueue_maintenance
+        enqueue_maintenance(conn, book['book_id'], version)
         if old:
-            from .long_memory import invalidate_version
-            invalidate_version(conn, book['book_id'], old[0])
+            enqueue_maintenance(conn, book['book_id'], old[0], invalidated=True)
             conn.execute("UPDATE chapters SET status='needs_review' WHERE book_id=? AND number>? AND status='committed'",(book['book_id'],number))
         conn.execute('UPDATE books SET revision=revision+1,ending=NULL WHERE id=?',(book['book_id'],))
         self.store.event(conn,book['book_id'],'chapter_committed',{'chapter_number':number,'version_id':version,'replaces':old[0] if old else None},run['run_id'])
@@ -955,6 +959,10 @@ class StoryService:
 
     def submit_task(self, task_id, lease_id, result, worker_id='host'):
         try:
+            if isinstance(result, dict) and 'context_lookup' in result:
+                if set(result) != {'context_lookup'} or not isinstance(result['context_lookup'], dict) or set(result['context_lookup']) != {'query','reason'}:
+                    raise StoryError('INVALID_LOOKUP', '补查须单独提交 query 与 reason。')
+                return self.lookup_task(task_id, lease_id, **result['context_lookup'], worker_id=worker_id)
             return self._submit_task(task_id, lease_id, result, worker_id)
         except StoryError as failure:
             # The validation transaction rolled back. Retain only a live, owned,
@@ -1092,15 +1100,41 @@ class StoryService:
                 payload['details']=details
             self.store.event(conn, task['book_id'], 'worker_failed', payload, run['run_id'])
 
-    def query(self,book_id,query,role='author',through_chapter=None,limit=10,task_id=None,lease_id=None):
+    def query(self,book_id,query,role='author',through_chapter=None,limit=10,task_id=None,lease_id=None,strategy='legacy'):
+        pov = None
         if task_id or lease_id:
             with self.store.read() as conn:
                 task=conn.execute('SELECT * FROM tasks WHERE id=? AND book_id=?',(task_id,book_id)).fetchone()
                 if not task or task['lease_id']!=lease_id or task['status']!='leased' or task['lease_until']<time.time():
                     raise StoryError('INVALID_LEASE','检索凭据失效。')
-                if task['stage']=='reader':
-                    if role!='reader' or through_chapter is None or through_chapter>task['chapter_number']:
-                        raise StoryError('INVALID_SCOPE','读者任务禁止访问作者资料或未来章节。')
+                run = conn.execute('SELECT status FROM runs WHERE id=?', (task['run_id'],)).fetchone()
+                if run['status'] != 'running':
+                    raise StoryError('INVALID_LEASE', '检索任务已暂停或失效。')
+                book = self.store.book(book_id)
+                if task['base_revision'] != book['revision']:
+                    raise StoryError('STALE_REVISION', '作品已更新，请重新领取任务。')
+                if task['stage'] == 'reader' and role != 'reader':
+                    raise StoryError('INVALID_SCOPE', '读者任务禁止读取作者资料。')
+                boundary = max(0, task['chapter_number'] - 1)
+                if through_chapter is not None and (type(through_chapter) is not int or not 0 <= through_chapter <= boundary):
+                    raise StoryError('INVALID_SCOPE', '任务检索只能读取当前章之前的资料。')
+                through_chapter = boundary if through_chapter is None else through_chapter
+                pov = (json.loads(task['input']).get('pov_context') or {}).get('pov')
+                # Scoped task queries use the same source/POV filter as lookup.
+                strategy = 'bounded'
+        if strategy == 'bounded':
+            from .retrieval import RetrievalScope, SQLiteRetriever
+            if role == 'reader' and through_chapter is None:
+                raise StoryError('INVALID_SCOPE', '读者检索必须指定已读章节。')
+            result = SQLiteRetriever(self.store).search(query, RetrievalScope(book_id,
+                through_chapter=through_chapter if through_chapter is not None else 2**31,
+                role=role, pov=pov), limit=limit)
+            result['hits'] = [{**hit, 'text': f"{hit['key']}：{hit['value']}",
+                'chapter_number': hit['source']['chapter_number'],
+                'source': {**hit['source'], 'quote': hit.get('evidence', '')}} for hit in result['hits']]
+            return {**result, 'role': role, 'through_chapter': through_chapter}
+        if strategy != 'legacy':
+            raise StoryError('INVALID_REQUEST', '未知检索策略。')
         return retrieve(self.store,book_id,query,role,through_chapter,limit)
 
     def _token_usage(self, conn, book_id):

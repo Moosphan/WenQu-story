@@ -144,11 +144,16 @@ def organize(data, selection=None, *, stage='draft'):
     if required:
         core['required_memory'] = required
     for key in ('supplementary_memory', 'reader_memory', 'existing_memory_keys', 'historical_evidence'):
-        for item in core.pop(key, []):
-            if _stable_ids(item) & references or item.get('hard_constraint') is True:
+        for index, item in enumerate(core.pop(key, [])):
+            if key == 'historical_evidence' and core.get('lookup_result') and index == 0:
+                # The top requested source may borrow soft quota; never spend a
+                # lookup turn then silently discard all its evidence. Capacity
+                # still applies and can block before the next provider call.
+                core.setdefault(key, []).append(item)
+            elif _stable_ids(item) & references or item.get('hard_constraint') is True:
                 core.setdefault('required_memory', []).append(item)
             else:
-                add(key, item, 40)
+                add(key, item, 100 if key == 'historical_evidence' else 40)
     promises = []
     for item in core.pop('planned_promises', []):
         if _ids(item) & settled:
@@ -212,6 +217,8 @@ class ContextCompiler:
         original = model_input(data)
 
         def measure(value):
+            if isinstance(value.get('lookup_result'), dict):
+                value['lookup_result']['delivered_count'] = len(value.get('historical_evidence', []))
             return self.counter.count(dumps(request_envelope(value, schema, system, tools, schema_twice)))
 
         before = measure(original)

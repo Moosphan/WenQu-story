@@ -54,3 +54,25 @@ async def test_stdio_mcp_reports_tool_failure_as_error(tmp_path):
             result = await session.call_tool("story_status", {"book_id": "missing"})
             assert result.isError
             assert "NOT_FOUND" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_stdio_lookup_refresh_and_pending_memory_tools(tmp_path, monkeypatch):
+    from test_task_lookup import writing
+    service, book, task = writing(tmp_path, monkeypatch)
+    environment = {**os.environ, 'PYTHONPATH': os.getcwd(), 'HULK_STORY_HOME': str(tmp_path)}
+    server = StdioServerParameters(command=sys.executable, args=['-m', 'story_core.mcp_server'], env=environment)
+    async with stdio_client(server) as streams:
+        async with ClientSession(*streams) as session:
+            await session.initialize()
+            names = {tool.name for tool in (await session.list_tools()).tools}
+            assert {'story_lookup', 'story_memory_propose', 'story_memory_proposals', 'story_memory_entities'} <= names
+            assert 'story_memory_decide' not in names
+            receipt = payload(await session.call_tool('story_lookup', {'task_id':task['task_id'], 'lease_id':task['lease_id'], 'query':'铜牌', 'reason':'核对旧约'}))
+            assert receipt['status'] == 'context_refreshed' and 'evidence' not in receipt
+            fresh = payload(await session.call_tool('story_next', {'book_id':book}))
+            assert fresh['input']['lookup_result']['delivered_count'] == 1
+            assert fresh['input']['historical_evidence'][0]['key'] == '铜牌旧约'
+            proposed = payload(await session.call_tool('story_memory_propose', {'book_id':book, 'request_id':'bad-batch', 'candidates':[{'value':'unsupported'}]}))
+            assert len(proposed['quarantined']) == 1
+            assert payload(await session.call_tool('story_memory_proposals', {'book_id':book}))['counts']['quarantined'] == 1

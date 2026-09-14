@@ -62,3 +62,18 @@ When a reviewer returns `revise`, preserve the verdict, evidence, and suggested 
 ## Completion language
 
 Call a chapter “定稿” only after the Core commits it. Call a book “可导出成稿” only when the Core marks it complete and export succeeds; that package may include EPUB 3 alongside text and manifest files. Partial export deliberately omits EPUB and retains an unfinished-draft label. Keep these separate from “真人读者验证”, “平台审核”, “签约”, and “已发布”; none follows automatically from a successful task or export.
+
+
+## 有限补查与待核实事实
+
+只有任务 `input.lookup_policy.remaining > 0` 时，可单独提交
+`{"context_lookup":{"query":"需要核对的线索","reason":"缺少什么证据"}}`，
+或调用 `story_lookup(task_id, lease_id, query, reason, worker_id)` / CLI `lookup`。
+收到 `context_refreshed` 回执后重新 `story_next`。回执不携带全量证据；新任务替换旧可选证据并重新装箱。
+每 run/章最多 2 次，重启不清零；每个实际模型调用照常计量，不占用最多 3 次内容审稿额度。
+证据不足仍是未知；额度耗尽后完成当前任务并明确无法确定之处，不能继续要求第三次补查。
+
+`story_memory_propose` 可提交来源版本绑定的候选事实，包含 `subject_entity_id`（或明确别名）、
+规范属性、值、`source_chapter`、`source_version`、原文 `evidence` 和显式 `story_valid_from`。
+使用 `story_memory_entities` 查询稳定实体，`story_memory_proposals` 查看待核实/隔离原因。
+不得把章号自动当故事时间，不得把原文匹配等同于语义核实。作者在资料库核实后接受；MCP 不提供接受事实的工具。

@@ -50,6 +50,14 @@ class SubmitRequest(StrictModel):
     worker_id: str = 'gui'
 
 
+class LookupRequest(StrictModel):
+    task_id: str
+    lease_id: str
+    query: str = Field(min_length=1, max_length=1000)
+    reason: str = Field(min_length=1, max_length=500)
+    worker_id: str = 'gui'
+
+
 class ExportRequest(StrictModel):
     allow_partial: bool = False
 
@@ -67,9 +75,42 @@ class ImportRequest(StrictModel):
 
 class QueryRequest(StrictModel):
     query: str
+    strategy: str = 'legacy'
     role: str = 'author'
     through_chapter: int | None = None
     limit: int = 10
+
+
+class MemoryEntityRequest(StrictModel):
+    name: str = Field(min_length=1, max_length=200)
+    entity_type: str = 'other'
+    actor: str = 'author'
+
+
+class MemoryProposalRequest(StrictModel):
+    candidates: list = Field(min_length=1, max_length=100)
+    request_id: str = Field(min_length=1, max_length=200)
+
+
+class MemoryDecisionRequest(StrictModel):
+    decision: str
+    expected_revision: int = Field(ge=0)
+    request_id: str = Field(min_length=1, max_length=200)
+    actor: str = 'author'
+    trust: bool = False
+    allow_conflict: bool = False
+
+
+class MemoryBindRequest(StrictModel):
+    entity_id: str
+    expected_revision: int = Field(ge=0)
+    request_id: str = Field(min_length=1, max_length=200)
+    actor: str = 'author'
+
+
+class MemoryMaintainRequest(StrictModel):
+    limit: int = Field(default=5, ge=1, le=20)
+    backfill: bool = False
 
 
 class BookKindRequest(StrictModel):
@@ -366,9 +407,45 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
     def submit(body: SubmitRequest):
         return service.submit_task(**body.model_dump())
 
+    @app.post('/api/tasks/lookup')
+    def lookup(body: LookupRequest):
+        return service.lookup_task(**body.model_dump())
+
     @app.post('/api/books/{book_id}/query')
     def query(book_id: str, body: QueryRequest):
         return service.query(book_id,**body.model_dump())
+
+    @app.get('/api/books/{book_id}/memory/entities')
+    def memory_entities(book_id: str, limit: int = 100, offset: int = 0):
+        return service.memory_entities(book_id, limit, offset)
+
+    @app.post('/api/books/{book_id}/memory/entities')
+    def memory_entity(book_id: str, body: MemoryEntityRequest):
+        return service.memory_entity(book_id, **body.model_dump())
+
+    @app.get('/api/books/{book_id}/memory/proposals')
+    def memory_proposals(book_id: str, status: str | None = None, limit: int = 50, offset: int = 0):
+        return service.memory_proposals(book_id, status, limit, offset)
+
+    @app.post('/api/books/{book_id}/memory/proposals')
+    def memory_propose(book_id: str, body: MemoryProposalRequest):
+        return service.memory_propose(book_id, origin='author', **body.model_dump())
+
+    @app.post('/api/books/{book_id}/memory/proposals/{proposal_id}/decision')
+    def memory_decide(book_id: str, proposal_id: str, body: MemoryDecisionRequest):
+        return service.memory_decide(book_id, proposal_id, **body.model_dump())
+
+    @app.post('/api/books/{book_id}/memory/proposals/{proposal_id}/bind')
+    def memory_bind(book_id: str, proposal_id: str, body: MemoryBindRequest):
+        return service.memory_bind(book_id, proposal_id, **body.model_dump())
+
+    @app.get('/api/books/{book_id}/memory/maintenance')
+    def memory_maintenance(book_id: str, limit: int = 50, offset: int = 0):
+        return service.memory_maintenance(book_id, limit, offset)
+
+    @app.post('/api/books/{book_id}/memory/maintenance')
+    def memory_maintain(book_id: str, body: MemoryMaintainRequest):
+        return service.memory_maintain(book_id, **body.model_dump())
 
     @app.post('/api/books/{book_id}/export')
     def export(book_id: str, body: ExportRequest):
