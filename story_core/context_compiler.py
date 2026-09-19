@@ -104,6 +104,8 @@ class Compilation:
 
     def require_executable(self):
         if not self.executable:
+            if self.diagnostics.get('blocked_reason') == 'unknown_model_capacity':
+                raise StoryError('CONTEXT_CAPACITY', '尚未识别当前模型的上下文容量；请刷新本机模型目录或配置该模型的容量。这不代表请求已经超限。', self.diagnostics)
             raise StoryError('CONTEXT_CAPACITY', '本阶段必要资料无法装入已配置模型容量，请检查上下文诊断并调整规划或模型容量。', self.diagnostics)
 
 
@@ -327,7 +329,7 @@ class ContextCompiler:
         return Compilation(final, diagnostics, count.tokens + policy.output_reserve + policy.overhead_reserve, executable)
 
 
-def compile_task(task, *, system=SYSTEM, tools=None, schema_twice=False, output_reserve=None, model=None):
+def compile_task(task, *, system=SYSTEM, tools=None, schema_twice=False, output_reserve=None, model=None, model_context_window=None):
     """Recount transport envelope, preserving the service's leased selection."""
     stage = task.get('stage', 'draft')
     saved = task.get('input', {}).get('context_diagnostics', {})
@@ -341,7 +343,13 @@ def compile_task(task, *, system=SYSTEM, tools=None, schema_twice=False, output_
                 raise ValueError()
         except (ValueError, TypeError):
             raise StoryError('INVALID_CONTEXT_POLICY', 'HULK_CONTEXT_MODEL_WINDOWS 必须为模型名到容量 token 正整数的 JSON 映射。') from None
-        policy = ContextPolicy(**{**asdict(policy), 'context_window': windows.get(model)})
+        fallback = model_context_window
+        if fallback is not None and policy.context_window is not None:
+            fallback = min(fallback, policy.context_window)
+        policy = ContextPolicy(**{**asdict(policy), 'context_window': windows.get(model, fallback)})
+    elif model_context_window is not None:
+        window = min(policy.context_window, model_context_window) if policy.context_window is not None else model_context_window
+        policy = ContextPolicy(**{**asdict(policy), 'context_window': window})
     # Actual transport output ceiling must always be reserved (including shadow).
     if output_reserve is not None:
         policy = ContextPolicy(**{**asdict(policy), 'output_reserve': output_reserve})

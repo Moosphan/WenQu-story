@@ -207,3 +207,42 @@ def test_codex_http_configuration_reports_executable(tmp_path, fake_codex):
         assert response.json()['local_codex']['auth_method'] == 'chatgpt'
         capabilities = client.get('/api/capabilities').json()
         assert capabilities['executor'] == 'codex' and capabilities['worker_configured']
+
+
+def test_codex_model_capacity_uses_exact_local_catalog_entry(tmp_path):
+    from story_core.codex_discovery import model_capacity
+    root = tmp_path / '.codex'; root.mkdir()
+    (root/'models_cache.json').write_text(json.dumps({'models': [
+        {'slug': 'chosen', 'context_window': 272000, 'max_context_window': 872000, 'effective_context_window_percent': 95},
+        {'slug': 'invalid', 'context_window': True}]}))
+    assert model_capacity('chosen', home=tmp_path) == 258400
+    assert model_capacity('missing', home=tmp_path) is None
+    assert model_capacity('invalid', home=tmp_path) is None
+
+
+def test_codex_capacity_fallback_does_not_override_explicit_limits(fake_codex, monkeypatch):
+    from story_core.codex_host import CodexCLI
+    monkeypatch.setattr('story_core.codex_host.model_capacity', lambda model: 100000)
+    monkeypatch.setenv('HULK_CONTEXT_MODE', 'adaptive')
+    monkeypatch.setenv('HULK_CONTEXT_MODEL_WINDOWS', json.dumps({'old-model': 1000000}))
+    provider = CodexCLI(model='explicit-model')
+    assert provider.generate(task()) == {'answer': '完成'}
+    assert provider.last_context['context_window'] == 100000
+    monkeypatch.setenv('HULK_CONTEXT_MODEL_WINDOWS', json.dumps({'explicit-model': 1}))
+    with pytest.raises(StoryError): provider.generate(task())
+    assert provider.last_context['context_window'] == 1
+
+
+def test_codex_catalog_caps_generic_window_and_unknown_remains_blocked():
+    from story_core.context_compiler import compile_task
+    value = task()
+    value['input']['context_diagnostics'] = {'policy': {'mode': 'adaptive', 'context_window': 1000000}}
+    assert compile_task(value, model='chosen', model_context_window=258400).diagnostics['context_window'] == 258400
+    value['input']['context_diagnostics']['policy']['context_window'] = 1
+    assert not compile_task(value, model='chosen', model_context_window=258400).executable
+    value['input']['context_diagnostics']['policy']['model_windows'] = {'other': 1000000}
+    assert not compile_task(value, model='chosen', model_context_window=258400).executable
+    value['input']['context_diagnostics']['policy']['context_window'] = None
+    unknown = compile_task(value, model='missing')
+    with pytest.raises(StoryError, match='尚未识别'):
+        unknown.require_executable()

@@ -176,7 +176,7 @@ def test_claude_unspecified_model_checks_profile_before_execute(tmp_path, monkey
         return json.dumps({'subtype': 'success', 'structured_output': {}})
     monkeypatch.setattr(provider, '_execute', execute)
     if mode == 'adaptive':
-        with pytest.raises(StoryError, match='本阶段必要资料'):
+        with pytest.raises(StoryError, match='尚未识别当前模型'):
             provider.generate(task)
         assert calls == []
     else:

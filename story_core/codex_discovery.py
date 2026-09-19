@@ -1,5 +1,6 @@
 """Credential-free local Codex discovery. No model requests or auth-file reads."""
 import os
+import json
 from pathlib import Path
 import re
 import shutil
@@ -20,6 +21,28 @@ def login_environment():
     for name in ('CODEX_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL'):
         environment.pop(name, None)
     return environment
+
+
+def model_capacity(model, home=None):
+    """Use the exact CLI catalog model's default window, never its opt-in maximum."""
+    root = Path(home) if home else Path.home()
+    directory = Path(os.environ.get('CODEX_HOME', root / '.codex')) if root == Path.home() else root / '.codex'
+    try:
+        path = directory / 'models_cache.json'
+        if path.stat().st_size > 8000000:
+            return None
+        data = json.loads(path.read_text(encoding='utf-8'))
+        for entry in data.get('models', []):
+            if entry.get('slug') != model:
+                continue
+            window = entry.get('context_window')
+            percent = entry.get('effective_context_window_percent', 100)
+            if type(window) is int and window > 0 and type(percent) is int and 0 < percent <= 100:
+                return window * percent // 100 or None
+            return None
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
 
 
 def executable_candidates():
