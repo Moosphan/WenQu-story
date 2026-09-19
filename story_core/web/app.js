@@ -889,8 +889,14 @@ function renderExecutionSummary() {
   if (blocker?.code === 'CONTEXT_CAPACITY') {
     const context = blocker.context || {};
     box.classList.add('is-failed'); title.textContent = `尚未启动：第 ${blocker.chapter_number} 章 · ${stages[blocker.stage]}`;
-    const missing = context.missing_hard_ids?.length ? `待补齐依赖：${context.missing_hard_ids.join('、')}。` : '';
-    detail.textContent = `必要资料 ${formatTokens(context.hard_tokens)} · 输出预留 ${formatTokens(context.output_reserve)} · 其他开销预留 ${formatTokens(context.overhead_reserve)} · 模型窗口 ${context.context_window ? formatTokens(context.context_window) : '尚未配置'}。${missing}请核对模型容量或调整本章规划，已保存正文保留。`;
+    if (context.missing_hard_ids?.length) {
+      title.textContent = `第 ${blocker.chapter_number} 章暂未开始：故事资料引用未找到`;
+      detail.textContent = `本章章纲引用了“${context.missing_hard_ids.join('”、“')}”，但系统未能关联到可用资料。尚未调用 AI，已保存正文不受影响。请在“规划”页核对对应伏笔或事实引用；资料存在却仍提示时，属于引用匹配问题。增加 Token 预算或更换大容量模型无法补齐这些引用。`;
+    } else if (!context.context_window) {
+      detail.textContent = '尚未识别当前模型能接收多少资料，因此暂未调用 AI。请在“AI 配置”中刷新或确认模型容量；已保存正文不受影响。';
+    } else {
+      detail.textContent = `本章必要资料加上生成正文的预留空间，超过当前模型可接收的容量，尚未调用 AI。资料 ${formatTokens(context.hard_tokens)}，正文预留 ${formatTokens(context.output_reserve)}，其他预留 ${formatTokens(context.overhead_reserve)}，模型容量 ${formatTokens(context.context_window)}。请在“AI 配置”选择更大容量的模型，或减少本章必须引用的资料。已保存正文不受影响。`;
+    }
     return;
   }
   if (blocker?.code === 'CONTEXT_LIMIT') {

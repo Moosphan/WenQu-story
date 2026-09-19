@@ -106,6 +106,8 @@ class Compilation:
         if not self.executable:
             if self.diagnostics.get('blocked_reason') == 'unknown_model_capacity':
                 raise StoryError('CONTEXT_CAPACITY', '尚未识别当前模型的上下文容量；请刷新本机模型目录或配置该模型的容量。这不代表请求已经超限。', self.diagnostics)
+            if self.diagnostics.get('missing_hard_ids'):
+                raise StoryError('CONTEXT_CAPACITY', '本章引用的故事资料未找到，暂未调用模型。请检查章纲中的伏笔或事实引用；增加模型容量无法补齐资料。', self.diagnostics)
             raise StoryError('CONTEXT_CAPACITY', '本阶段必要资料无法装入已配置模型容量，请检查上下文诊断并调整规划或模型容量。', self.diagnostics)
 
 
@@ -145,6 +147,15 @@ def organize(data, selection=None, *, stage='draft'):
     plan = core.get('chapter_plan') or {}
     number = core.get('chapter_number', 1)
     references = set(plan.get('required_fact_ids', [])) | set(plan.get('promise_ids', [])) | set(core.get('context_required_ids', []))
+    # Legacy outlines reference promises by their unique plan key, not a UUID.
+    # Never let a display name stand in for an explicit fact/source identifier.
+    promise_names = (set(plan.get('promise_ids', [])) | set(core.get('context_promise_ids', []))) - set(plan.get('required_fact_ids', [])) - set(core.get('context_fact_ids', []))
+
+    def reference_ids(item, promise=False):
+        ids = _stable_ids(item)
+        if promise or item.get('kind') == 'promise':
+            ids |= {item['key']} & promise_names if item.get('key') else set()
+        return ids
     participants = set(plan.get('participants', [])) | ({plan['pov']} if plan.get('pov') else set())
     obligation_ids = set().union(*(_ids(p) for p in core.get('promise_obligations', [])))
     optional = []
@@ -161,7 +172,7 @@ def organize(data, selection=None, *, stage='draft'):
     required = []
     for item in core.pop('required_memory', []):
         due = item.get('due_chapter')
-        hard = bool(_stable_ids(item) & references or _ids(item) & obligation_ids) or item.get('hard_constraint') is True
+        hard = bool(reference_ids(item) & references or _ids(item) & obligation_ids) or item.get('hard_constraint') is True
         # Legacy name/keyword/open status is retrieval evidence, not necessity.
         hard |= not item.get('context_reason') and item.get('kind') != 'promise'
         hard |= item.get('kind') == 'promise' and item.get('status') in ('open', 'active', 'due') and type(due) is int and due <= number
@@ -180,7 +191,7 @@ def organize(data, selection=None, *, stage='draft'):
                 # lookup turn then silently discard all its evidence. Capacity
                 # still applies and can block before the next provider call.
                 core.setdefault(key, []).append(item)
-            elif _stable_ids(item) & references or item.get('hard_constraint') is True:
+            elif reference_ids(item) & references or item.get('hard_constraint') is True:
                 core.setdefault('required_memory', []).append(item)
             else:
                 add(key, item, 100 if key == 'historical_evidence' else 40)
@@ -189,7 +200,7 @@ def organize(data, selection=None, *, stage='draft'):
         if _ids(item) & settled:
             continue
         due, setup = item.get('due_chapter'), item.get('setup_chapter')
-        if _stable_ids(item) & references or _ids(item) & obligation_ids or setup == number or (type(due) is int and due <= number):
+        if reference_ids(item, promise=True) & references or _ids(item) & obligation_ids or setup == number or (type(due) is int and due <= number):
             promises.append(item)
         elif type(due) is int and due <= number + 2:
             add('planned_promises', item, 65)
@@ -243,7 +254,7 @@ def organize(data, selection=None, *, stage='draft'):
     available = set()
     for key in ('required_memory', 'current_state', 'planned_promises', 'promise_obligations', 'scheduled_promises'):
         for item in core.get(key, []):
-            available.update(_stable_ids(item))
+            available.update(reference_ids(item, promise=key in ('planned_promises', 'promise_obligations', 'scheduled_promises')))
     missing = sorted(references - available)
     return core, optional, missing
 
