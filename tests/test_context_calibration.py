@@ -118,3 +118,31 @@ def test_host_aggregate_or_unknown_model_is_not_misattributed():
     assert calibration_report([row])['eligible_calls'] == 0
     row['context']['model'] = 'actual-one'
     assert calibration_report([row])['eligible_calls'] == 1
+
+
+def test_calibration_reports_observed_overhead_and_output_coverage_without_claiming_safety():
+    from story_core.context_calibration import calibration_report
+    rows = [{'call_id': str(i), 'executor': 'api',
+             'context': {'model': 'm', 'counter': 'local-tokenizer-envelope-estimate:fixture',
+                         'final_tokens': 100, 'fingerprint': str(i), 'stage': stage,
+                         'output_reserve': 12000},
+             'usage_breakdown': {'input_tokens': actual, 'output_tokens': output},
+             'status': status, 'error': error}
+            for i, (stage, actual, output, status, error) in enumerate([
+                ('draft', 150, 12000, 'failed', 'TRUNCATED_OUTPUT'),
+                ('reader', 110, 300, 'completed', None)])]
+    group = calibration_report(rows)['groups'][0]
+    assert group['observed_extra_input_tokens'] == 50
+    assert group['stages'] == ['draft', 'reader']
+    assert group['output_samples'] == 2
+    assert group['max_output_tokens'] == 12000
+    assert group['outputs_at_reserve'] == 1
+    assert group['capacity_validated'] is False
+
+
+def test_conflicting_output_measurements_exclude_entire_call():
+    from story_core.context_calibration import calibration_report
+    row = {'call_id': 'one', 'executor': 'api', 'context': {'model': 'm', 'counter': 'c',
+           'final_tokens': 100, 'fingerprint': 'x'}, 'usage_breakdown': {'input_tokens': 80, 'output_tokens': 10}}
+    other = {**row, 'usage_breakdown': {'input_tokens': 80, 'output_tokens': 20}}
+    assert calibration_report([row, other])['eligible_calls'] == 0

@@ -47,7 +47,9 @@ def calibration_report(records):
         value = {'executor': _label(execution.get('executor') or row.get('executor')),
                  'model': _label(context.get('model')), 'counter': _label(context.get('counter')),
                  'estimate': _count(context.get('final_tokens')), 'actual': _count(usage.get('input_tokens')),
-                 'fingerprint': _label(context.get('fingerprint'))}
+                 'fingerprint': _label(context.get('fingerprint')),
+                 'stage': _label(context.get('stage')), 'output': _count(usage.get('output_tokens')),
+                 'output_reserve': _count(context.get('output_reserve'))}
         if 'models' in execution and execution['models'] != [value['model']]:
             value['actual'] = None
         identity = row['call_id']
@@ -59,19 +61,30 @@ def calibration_report(records):
             calls[identity] = value
     groups, eligible = {}, 0
     for identity, value in calls.items():
-        if identity in conflicts or any(value[key] is None for key in value) or not value['estimate']:
+        required = ('executor', 'model', 'counter', 'estimate', 'actual', 'fingerprint')
+        if identity in conflicts or any(value[key] is None for key in required) or not value['estimate']:
             continue
         eligible += 1
         key = (value['executor'], value['model'], value['counter'])
         group = groups.setdefault(key, {'executor': key[0], 'model': key[1], 'counter': key[2],
             'calls': 0, 'underestimated_calls': 0, 'estimated_input_tokens': 0, 'reported_input_tokens': 0,
-            'max_actual_to_estimate': 0, 'max_underestimate_tokens': 0})
+            'max_actual_to_estimate': 0, 'max_underestimate_tokens': 0,
+            'observed_extra_input_tokens': 0, 'stages': [], 'output_samples': 0,
+            'max_output_tokens': None, 'outputs_at_reserve': 0, 'capacity_validated': False})
         group['calls'] += 1
         group['underestimated_calls'] += value['actual'] > value['estimate']
         group['estimated_input_tokens'] += value['estimate']
         group['reported_input_tokens'] += value['actual']
         group['max_actual_to_estimate'] = max(group['max_actual_to_estimate'], value['actual'] / value['estimate'])
         group['max_underestimate_tokens'] = max(group['max_underestimate_tokens'], value['actual'] - value['estimate'])
+        group['observed_extra_input_tokens'] = group['max_underestimate_tokens']
+        if value['stage'] is not None:
+            group['stages'] = sorted(set(group['stages']) | {value['stage']})
+        if value['output'] is not None:
+            group['output_samples'] += 1
+            group['max_output_tokens'] = max(group['max_output_tokens'] or 0, value['output'])
+            group['outputs_at_reserve'] += (value['output_reserve'] is not None
+                                           and value['output'] >= value['output_reserve'])
     return {'version': 'offline-calibration-v1', 'unique_calls': len(calls), 'eligible_calls': eligible,
         'ineligible_calls': len(calls) - eligible, 'invalid_records': invalid, 'duplicate_calls': duplicates,
         'conflicting_calls': len(conflicts), 'groups': [groups[key] for key in sorted(groups)],
@@ -80,6 +93,7 @@ def calibration_report(records):
             'Native cache fields must all be reported; missing fields remain unknown.',
             'Reported host models must match the estimated model exactly; multi-model aggregates are excluded.',
             'Supplied call identity and usage provenance are trusted, not independently authenticated.',
+            'Observed extra input includes tokenizer/template differences, not an isolated measurement of hidden instructions.',
             'Ratios describe supplied samples only, not validated capacity, pricing, or a safe reduction of reserves.']}
 
 

@@ -46,8 +46,15 @@ class ContextPolicy:
     output_reserve: int = 12000
     overhead_reserve: int = 4000
     model_windows: dict | None = None
+    tokenizer_profiles: dict | None = None
+    counting_model: str | None = None
 
     def __post_init__(self):
+        from .token_counting import validate_profiles
+        validate_profiles(self.tokenizer_profiles)
+        if self.counting_model is not None and (not isinstance(self.counting_model, str)
+                or not self.counting_model.strip() or self.counting_model not in (self.tokenizer_profiles or {})):
+            raise StoryError('INVALID_TOKENIZER_PROFILE', '首次装箱计量模型必须匹配已配置的分词器。')
         if self.model_windows is not None and (not isinstance(self.model_windows, dict) or
                 any(not isinstance(name, str) or not name or type(size) is not int or size <= 0
                     for name, size in self.model_windows.items())):
@@ -241,7 +248,11 @@ def organize(data, selection=None, *, stage='draft'):
 class ContextCompiler:
     def __init__(self, policy=None, counter=None):
         self.policy = policy or ContextPolicy()
-        self.counter = counter or ConservativeCounter()
+        if counter is None and self.policy.counting_model is not None and self.policy.model_windows is not None:
+            self.policy = ContextPolicy(**{**asdict(self.policy),
+                'context_window': self.policy.model_windows.get(self.policy.counting_model)})
+        from .token_counting import counter_for_model
+        self.counter = counter or counter_for_model(self.policy.tokenizer_profiles, self.policy.counting_model)
 
     def compile(self, data, schema, *, stage, system=SYSTEM, tools=None, schema_twice=False, prepared=False):
         policy = self.policy
@@ -333,7 +344,8 @@ def compile_task(task, *, system=SYSTEM, tools=None, schema_twice=False, output_
     # Actual transport output ceiling must always be reserved (including shadow).
     if output_reserve is not None:
         policy = ContextPolicy(**{**asdict(policy), 'output_reserve': output_reserve})
-    result = ContextCompiler(policy).compile(task['input'], task['output_schema'], stage=stage, system=system,
+    from .token_counting import counter_for_model
+    result = ContextCompiler(policy, counter_for_model(policy.tokenizer_profiles, model)).compile(task['input'], task['output_schema'], stage=stage, system=system,
         tools=tools, schema_twice=schema_twice, prepared=bool(saved))
     if saved.get('missing_hard_ids') and policy.mode == 'adaptive':
         result.executable = False
