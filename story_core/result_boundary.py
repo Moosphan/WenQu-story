@@ -12,6 +12,10 @@ SUPPLEMENTS = {'continuity': 'revision_verification', 'revise': 'revision_respon
 
 
 def validate_output(stage, result, book, candidate, inputs):
+    if stage == 'outline' and inputs.get('outline_batch'):
+        batch = inputs['outline_batch']
+        validate(stage, result, book, candidate, outline_range=(batch['start'], batch['end']))
+        return result, None
     field = SUPPLEMENTS.get(stage)
     if not isinstance(result, dict) or not field:
         validate(stage, result, book, candidate)

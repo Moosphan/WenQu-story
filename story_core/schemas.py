@@ -88,13 +88,13 @@ def length_requirement(target):
             'counting': '汉字及英文/数字词组，标点和空白不计'}
 
 
-def validate(stage, result, book, candidate=None):
+def validate(stage, result, book, candidate=None, *, outline_range=None, result_size_limit=100000):
     if not isinstance(result, dict):
         raise StoryError("INVALID_RESULT", "结果必须是 JSON 对象。")
     errors = sorted(Draft202012Validator(SCHEMAS[stage]).iter_errors(result), key=lambda e: str(e.path))
     if errors:
         raise StoryError("INVALID_RESULT", "任务结果不符合协议。", {"errors": [{"path": list(e.path), "message": e.message} for e in errors[:8]]})
-    if len(json.dumps(result, ensure_ascii=False).encode()) > 100000:
+    if len(json.dumps(result, ensure_ascii=False).encode()) > result_size_limit:
         raise StoryError("INVALID_RESULT", "单次任务结果过大。")
     if stage == "outline":
         total = book["settings"]["chapter_count"]
@@ -104,7 +104,10 @@ def validate(stage, result, book, candidate=None):
             if not previous_end < start <= end <= total:
                 raise StoryError('INVALID_RESULT', '卷纲章节范围须按顺序排列、不重叠且不超出全书。')
             previous_end = end
-        if [c["number"] for c in result["chapters"]] != list(range(1, total + 1)):
+        start, end = outline_range if outline_range is not None else (1, total)
+        if [c["number"] for c in result["chapters"]] != list(range(start, end + 1)):
+            if outline_range is not None:
+                raise StoryError('INVALID_RESULT', f'本批章纲必须恰好覆盖第 {start}–{end} 章，编号连续。', {'expected_start': start, 'expected_end': end, 'received_count': len(result['chapters'])})
             raise StoryError("INVALID_RESULT", "章节规划必须覆盖整本书，编号连续。")
         for promise in result["promises"]:
             if not promise["setup_chapter"] <= promise["due_chapter"] <= total:

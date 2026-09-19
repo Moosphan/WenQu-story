@@ -720,6 +720,8 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
                 data['previous_plan'] = book['plan']
                 data['instruction'] += '\n这是中途调整篇幅。保留已写章节的骨架与已发生事实，扩展或收束后续世界观、卷纲、章纲和伏笔；不要重写已完成正文。'
             data['context_manifest'] = _context_manifest(book, 'author', 0)
+            from .outline_batches import prepare
+            prepare(conn, book, run, data)
             return data
         data['chapter_plan'] = next((c for c in book['plan']['chapters'] if c['number']==number), None)
         if stage in ('draft', 'revise', 'arc', 'ending'):
@@ -890,6 +892,9 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
         schema = adjudication_schema(data['review_adjudication']) if data.get('review_adjudication') else REPAIR_SCHEMA if data.get('extraction_repair') else review_source_schema(run['candidate']) if run['stage'] == 'continuity' else SCHEMAS[run['stage']]
         if data.get('revision_mode') in ('expand_full_body', 'full_body'):
             schema = SCHEMAS['revise']['oneOf'][0]
+        if data.get('outline_batch'):
+            from .outline_batches import output_schema
+            schema = output_schema(data['outline_batch'])
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
         reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
         policy = replace(policy, output_reserve=max(MAX_TASK_OUTPUT_TOKENS, policy.output_reserve))
@@ -1197,11 +1202,18 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
                     {'task_id': task_id, **warning}, run['run_id'])
             if stage in ('brief','outline'):
                 field='brief' if stage=='brief' else 'plan'
-                conn.execute(f'UPDATE books SET {field}=?,revision=revision+1 WHERE id=?',(dumps(result),book['book_id']))
+                published, complete = result, True
+                inputs = json.loads(task['input'])
+                if stage == 'outline' and inputs.get('outline_batch'):
+                    from .outline_batches import assemble
+                    published, complete = assemble(conn, book, run, inputs, result)
+                    self.store.event(conn, book['book_id'], 'outline_batch_completed', inputs['outline_batch'], run['run_id'])
+                if complete:
+                    conn.execute(f'UPDATE books SET {field}=?,revision=revision+1 WHERE id=?',(dumps(published),book['book_id']))
                 if stage=='brief' and book['title']=='未命名作品':
                     conn.execute('UPDATE books SET title=? WHERE id=?',(result['title'],book['book_id']))
                 requested_revision = any(review.get('stage') == 'author' for review in run['reviews'] or [])
-                self._set_stage(conn,run,'outline' if stage=='brief' else 'revise' if requested_revision else 'extract' if run['candidate'] else 'draft')
+                self._set_stage(conn,run,'outline' if stage=='brief' or not complete else 'revise' if requested_revision else 'extract' if run['candidate'] else 'draft')
             elif stage in ('draft','revise'):
                 conn.execute("UPDATE runs SET candidate=?,extraction=NULL,reviews='[]',stage='extract' WHERE id=?",(dumps({'title': result['title'], 'body': result['body']}),run['run_id']))
             elif stage=='extract':
