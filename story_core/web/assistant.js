@@ -10,6 +10,7 @@ window.WenQuAssistant = {
     function contextChanged() {
       const context = getContext(), next = context.book?.book_id || null;
       element('open-assistant').disabled = !next;
+      element('open-assistant').hidden = !next;
       if (bookId !== next) {
         if (bookId) drafts.set(bookId, element('assistant-message').value);
         bookId = next; generation++; loading = false; sending = false; applying = false;
@@ -130,7 +131,7 @@ window.WenQuAssistant = {
       } catch (failure) { if (generation === request) error(failure.message); }
       finally { if (generation === request) { applying = false; render(); } }
     }
-    element('open-assistant').addEventListener('click', open);
+    element('open-assistant').addEventListener('click', () => opened ? close() : open());
     element('close-assistant').addEventListener('click', close);
     element('assistant-form').addEventListener('submit', event => { event.preventDefault(); send(); });
     const prompts = {

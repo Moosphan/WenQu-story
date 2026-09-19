@@ -1324,8 +1324,11 @@ function bind() {
     onApplied: async () => { await refreshStatus(); notice('已按确认方案启动独立规划；已有正文保留，规划完成后再单独继续写作。'); }
   });
   for (const view of ['ranks','ideas']) action(`market-tab-${view}`, () => { element('market-sources').hidden = view !== 'ranks'; element('market-ideas-panel').hidden = view !== 'ideas'; for (const name of ['ranks','ideas']) element(`market-tab-${name}`).classList.toggle('selected', name === view); });
-  document.addEventListener('pointerdown', event => closeShelfMenus(event.target.closest?.('.shelf-menu')));
-  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeShelfMenus(null, true); });
+  document.addEventListener('pointerdown', event => {
+    closeShelfMenus(event.target.closest?.('.shelf-menu'));
+    if (!event.target.closest?.('#project-menu')) element('project-menu').open = false;
+  });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') { closeShelfMenus(null, true); element('project-menu').open = false; } });
   action('open-trash', showTrash); action('home-trash', showTrash); action('close-trash', () => closeDialog('trash-dialog'));
   element('dismiss-notice').addEventListener('click', () => notice(''));
   element('create-form').addEventListener('submit', async event => {
