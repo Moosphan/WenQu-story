@@ -12,20 +12,21 @@ SUPPLEMENTS = {'continuity': 'revision_verification', 'revise': 'revision_respon
 
 
 def validate_output(stage, result, book, candidate, inputs):
+    short_failures = inputs.get('length_short_failures', 0)
     if stage == 'outline' and inputs.get('outline_batch'):
         batch = inputs['outline_batch']
         validate(stage, result, book, candidate, outline_range=(batch['start'], batch['end']))
         return result, None
     field = SUPPLEMENTS.get(stage)
     if not isinstance(result, dict) or not field:
-        validate(stage, result, book, candidate)
+        validate(stage, result, book, candidate, short_failures=short_failures)
         return result, None
     # Keep the original size cap, even when annotations are discarded.
     from .storage import dumps
     if len(dumps(result).encode()) > 100000:
         raise StoryError('INVALID_RESULT', '单次任务结果过大。')
     core = {key: value for key, value in result.items() if key != field}
-    validate(stage, core, book, candidate)
+    validate(stage, core, book, candidate, short_failures=short_failures)
     schema = SCHEMAS[stage]
     if stage == 'revise':
         schema = schema['oneOf'][0]  # Patches are materialized before this boundary.

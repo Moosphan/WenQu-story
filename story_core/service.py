@@ -827,7 +827,20 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             data['reviews'] = run['reviews']
             data['feedback_items'] = feedback_items(run['reviews'])
         if stage in ('draft', 'revise'):
-            data['length_requirement'] = length_requirement(book['settings']['target_words'])
+            short_failures = 0
+            for prior in conn.execute("SELECT id,input,status,base_revision FROM tasks WHERE book_id=? AND run_id=? AND chapter_number=? AND stage=? AND status!='lookup' ORDER BY created_at DESC,rowid DESC", (book['book_id'], run['run_id'], number, stage)):
+                if prior['status'] == 'submitted' or prior['base_revision'] != book['revision'] or json.loads(prior['input']).get('candidate') != candidate:
+                    break
+                rejected = conn.execute("SELECT payload FROM events WHERE book_id=? AND run_id=? AND kind IN ('task_result_rejected','worker_failed') AND json_extract(payload,'$.task_id')=? ORDER BY seq DESC LIMIT 1", (book['book_id'], run['run_id'], prior['id'])).fetchone()
+                failure = json.loads(rejected[0]) if rejected else {}
+                details = failure.get('details', {})
+                if failure.get('code') != 'WORD_COUNT' or not isinstance(details.get('count'), int) or details['count'] >= details.get('min', 0):
+                    break
+                short_failures += 1
+                if short_failures == 2:
+                    break
+            data['length_short_failures'] = short_failures
+            data['length_requirement'] = length_requirement(book['settings']['target_words'], short_failures)
             if candidate:
                 data['length_requirement']['current_count'] = word_count(candidate['body'])
             data['instruction'] += '\n按 length_requirement.target 写足本章，不以 min 为写作目标。计数不含标点空白；返修后的完整正文（包括应用 patches 后）也须满足范围。原稿不足时，补足本章目标内的尝试、阻力、对话交锋、结果及情绪余波；不能靠重复解释、回顾或无关支线凑字数。删除有问题的说明后保留必要场景，不把去AI味理解为持续缩短正文。length_feedback 是上次实际校验结果，重试须结合它调整正文，不能重复提交同样的删改。'
@@ -837,7 +850,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
                 for row in conn.execute("SELECT payload FROM events WHERE book_id=? AND kind IN ('task_result_rejected','worker_failed') ORDER BY seq DESC", (book['book_id'],)):
                     failure = json.loads(row['payload'])
                     if failure.get('task_id') == previous['id'] and failure.get('code') == 'WORD_COUNT' and failure.get('details'):
-                        data['length_feedback'] = {'task_id': previous['id'], 'count': failure['details'].get('count'), **length_requirement(book['settings']['target_words'])}
+                        data['length_feedback'] = {'task_id': previous['id'], 'count': failure['details'].get('count'), **data['length_requirement']}
                         break
             if stage == 'draft' and previous and previous['status'] != 'submitted' and previous['base_revision'] == book['revision']:
                 for row in conn.execute("SELECT payload FROM events WHERE book_id=? AND run_id=? AND kind='task_result_rejected' ORDER BY seq DESC", (book['book_id'], run['run_id'])):
@@ -869,6 +882,11 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
                     'minimum_additional_words': max(0, bounds['min'] - bounds['current_count']),
                     'target_additional_words': max(0, bounds['target'] - bounds['current_count'])}
                 data['instruction'] = instruction('revise', revision_mode='expand_full_body') + _author_material_instruction(book['project'])
+        if stage in ('draft', 'revise'):
+            bounds = data['length_requirement']
+            data['instruction'] += f"\n字数以系统计数为准：汉字及英文/数字词组，标点空白不计。目标 {bounds['target']} 字，允许 {bounds['min']}–{bounds['max']} 字。length_feedback 是上次实际校验结果，须针对不足补写有效行动和对话；不能靠重复解释凑字数。"
+            if short_failures >= 2:
+                data['instruction'] += '\n连续两次正文偏短，本次已适度放宽最低字数；仍以目标字数创作，不再继续降低下限。情节、连续性和审稿要求不变。'
         if stage == 'ending':
             data['plan'] = book['plan']
             data['committed_chapters'] = [dict(r) for r in conn.execute('''SELECT c.number,c.version_id,v.title FROM chapters c JOIN chapter_versions v ON v.id=c.version_id

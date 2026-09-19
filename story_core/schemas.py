@@ -82,13 +82,16 @@ def word_count(text):
     return len(re.findall(r"[\u3400-\u9fff]|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", text))
 
 
-def length_requirement(target):
+def length_requirement(target, short_failures=0):
     """Shared authoring/validation bounds; aim at target, not the lower bound."""
-    return {'target': target, 'min': math.ceil(target * .9), 'max': math.floor(target * 1.6),
+    minimum = math.ceil(target * .9)
+    if short_failures >= 2:
+        minimum = min(minimum, max(math.ceil(target * .75), min(1800, math.ceil(target * 1800 / 2300))))
+    return {'target': target, 'min': minimum, 'max': math.floor(target * 1.6),
             'counting': '汉字及英文/数字词组，标点和空白不计'}
 
 
-def validate(stage, result, book, candidate=None, *, outline_range=None, result_size_limit=100000):
+def validate(stage, result, book, candidate=None, *, outline_range=None, result_size_limit=100000, short_failures=0):
     if not isinstance(result, dict):
         raise StoryError("INVALID_RESULT", "结果必须是 JSON 对象。")
     errors = sorted(Draft202012Validator(SCHEMAS[stage]).iter_errors(result), key=lambda e: str(e.path))
@@ -117,7 +120,7 @@ def validate(stage, result, book, candidate=None, *, outline_range=None, result_
     if stage in ("draft", "revise"):
         count = word_count(result["body"])
         target = book["settings"]["target_words"]
-        bounds = length_requirement(target)
+        bounds = length_requirement(target, short_failures)
         if not bounds['min'] <= count <= bounds['max']:
             action = '补足' if count < bounds['min'] else '压缩'
             raise StoryError("WORD_COUNT", f"正文{count}字，目标{target}字，允许{bounds['min']}–{bounds['max']}字，需要{action}正文。",

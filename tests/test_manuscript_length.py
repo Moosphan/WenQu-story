@@ -16,6 +16,63 @@ def test_short_chapter_is_not_accepted_at_old_65_percent_floor():
     validate('draft', {'title': '渡口', 'body': '字' * 2300}, book)
 
 
+def test_two_short_attempts_relax_only_the_next_task(tmp_path):
+    s, b = make(tmp_path)
+    t = to_stage(s, b, 'draft')
+    for attempt in range(2):
+        assert t['input']['length_requirement']['min'] == 72
+        with pytest.raises(StoryError) as error:
+            s.submit_task(t['task_id'], t['lease_id'], {'title': '渡口', 'body': '字' * 60})
+        s.fail_task(t['task_id'], t['lease_id'], error.value)
+        s.control(b, 'resume')
+        t = s.next_task(b)
+    assert t['input']['length_requirement']['min'] == 63
+    assert t['input']['length_requirement']['target'] == 80
+    s.submit_task(t['task_id'], t['lease_id'], {'title': '渡口', 'body': '字' * 63})
+    assert s.status(b)['run']['stage'] == 'extract'
+
+
+def test_relaxed_length_floor_for_normal_chapter():
+    from story_core.schemas import length_requirement
+    assert length_requirement(2300, short_failures=2)['min'] == 1800
+    assert length_requirement(2311, short_failures=9)['min'] == 1800
+    assert length_requirement(2300, short_failures=1)['min'] == 2070
+
+
+def test_long_failure_breaks_short_streak(tmp_path):
+    s, b = make(tmp_path)
+    t = to_stage(s, b, 'draft')
+    for size in (60, 150, 60):
+        with pytest.raises(StoryError) as error:
+            s.submit_task(t['task_id'], t['lease_id'], {'title': '渡口', 'body': '字' * size})
+        s.fail_task(t['task_id'], t['lease_id'], error.value)
+        s.control(b, 'resume')
+        t = s.next_task(b)
+    assert t['input']['length_requirement']['min'] == 72
+
+
+def test_revision_relaxes_after_two_failures_and_keeps_guidance(tmp_path):
+    s, b = make(tmp_path)
+    t = to_stage(s, b, 'draft')
+    s.submit_task(t['task_id'], t['lease_id'], result_for(t))
+    t = s.next_task(b)
+    s.submit_task(t['task_id'], t['lease_id'], result_for(t))
+    t = s.next_task(b)
+    s.submit_task(t['task_id'], t['lease_id'], result_for(t, True))
+    t = s.next_task(b)
+    for size in (40, 60):
+        with pytest.raises(StoryError) as error:
+            s.submit_task(t['task_id'], t['lease_id'], {'title': '渡口', 'body': '字' * size})
+        s.fail_task(t['task_id'], t['lease_id'], error.value)
+        s.control(b, 'resume')
+        t = s.next_task(b)
+    assert t['input']['length_requirement']['min'] == 63
+    assert '连续两次' in t['input']['instruction']
+    assert 'length_feedback' in t['input']['instruction']
+    s.submit_task(t['task_id'], t['lease_id'], {'title': '渡口', 'body': '字' * 63})
+    assert s.status(b)['run']['stage'] == 'extract'
+
+
 def test_retry_receives_length_error_and_preserves_candidate(tmp_path):
     s, b = make(tmp_path)
     t = to_stage(s, b, 'draft')
