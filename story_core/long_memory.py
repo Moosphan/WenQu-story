@@ -10,6 +10,7 @@ import json
 import math
 
 from .errors import StoryError
+from .memory_identity import resolve_entity_id, resolve_fact_id, canonical_value, preview_entity_merge, merge_entities
 from .storage import dumps, uid
 
 SCHEMA = """
@@ -92,21 +93,23 @@ def register_entity(conn, book_id, display_name, *, entity_type='other', branch_
     existing = conn.execute('SELECT * FROM lm_entities WHERE id=?', (entity_id,)).fetchone()
     if existing:
         _entity(conn, book_id, entity_id, branch_id)
-        return entity_id
+        return resolve_entity_id(conn, book_id, entity_id, branch_id=branch_id)
     conn.execute('INSERT INTO lm_entities VALUES (?,?,?,?,?)',
                  (entity_id, book_id, branch_id, display_name, entity_type))
+    entity_id = resolve_entity_id(conn, book_id, entity_id, branch_id=branch_id)
     register_alias(conn, book_id, entity_id, display_name, branch_id=branch_id)
     return entity_id
 
 
 def register_alias(conn, book_id, entity_id, alias, *, branch_id='main'):
     _book(conn, book_id, branch_id)
-    _entity(conn, book_id, entity_id, branch_id)
+    entity_id = resolve_entity_id(conn, book_id, entity_id, branch_id=branch_id)
     conn.execute('INSERT OR IGNORE INTO lm_aliases VALUES (?,?,?,?)',
                  (book_id, branch_id, _text(alias, 'alias'), entity_id))
 
 
 def rename_entity(conn, book_id, entity_id, display_name, *, branch_id='main'):
+    entity_id = resolve_entity_id(conn, book_id, entity_id, branch_id=branch_id)
     register_alias(conn, book_id, entity_id, display_name, branch_id=branch_id)
     conn.execute('UPDATE lm_entities SET display_name=? WHERE id=?', (display_name.strip(), entity_id))
     return entity_id
@@ -116,9 +119,10 @@ def resolve_alias(conn, book_id, alias, *, branch_id='main'):
     _book(conn, book_id, branch_id)
     rows = conn.execute('SELECT entity_id FROM lm_aliases WHERE book_id=? AND branch_id=? AND alias=?',
                         (book_id, branch_id, _text(alias, 'alias'))).fetchall()
+    rows = sorted({resolve_entity_id(conn, book_id, row[0], branch_id=branch_id) for row in rows})
     if len(rows) > 1:
         raise StoryError('AMBIGUOUS_ENTITY', '该别名对应多个实体，请明确指定实体 ID。')
-    return rows[0][0] if rows else None
+    return rows[0] if rows else None
 
 
 def _chapter_number(number, field, *, allow_zero=False):
@@ -143,7 +147,8 @@ def record_fact(conn, book_id, subject_entity_id, predicate, value, *, source_ch
                 recorded_revision=0):
     """Append an immutable assertion; return its stable subject/predicate/scope ID."""
     _book(conn, book_id, branch_id)
-    _entity(conn, book_id, subject_entity_id, branch_id)
+    subject_entity_id = resolve_entity_id(conn, book_id, subject_entity_id, branch_id=branch_id)
+    value = canonical_value(conn, book_id, value, branch_id)
     predicate = _text(predicate, 'predicate')
     if scope not in {'objective', 'character_belief', 'author_plan'} or visibility not in {'reader', 'author'}:
         raise StoryError('INVALID_SCOPE', '事实范围无效。')
@@ -152,7 +157,7 @@ def record_fact(conn, book_id, subject_entity_id, predicate, value, *, source_ch
     if scope != 'character_belief' and owner_entity_id:
         raise StoryError('INVALID_SCOPE', '只有角色信念可以指定所属实体。')
     if owner_entity_id:
-        _entity(conn, book_id, owner_entity_id, branch_id)
+        owner_entity_id = resolve_entity_id(conn, book_id, owner_entity_id, branch_id=branch_id)
     if type(verified) is not bool:
         raise StoryError('INVALID_REQUEST', 'verified 必须为显式布尔值。')
     for instant in (story_valid_from, story_valid_to):
@@ -237,20 +242,24 @@ def current_state(conn, book_id, entity_ids, *, through_chapter=None, story_time
     if type(story_time) not in (int, float) or not math.isfinite(story_time):
         raise StoryError('INVALID_SCOPE', '必须指定有限故事时间。')
     if pov_entity_id:
-        _entity(conn, book_id, pov_entity_id, branch_id)
-    ids = list(dict.fromkeys(entity_ids))
+        pov_entity_id = resolve_entity_id(conn, book_id, pov_entity_id, branch_id=branch_id)
+    ids = list({resolve_entity_id(conn, book_id, eid, branch_id=branch_id) for eid in entity_ids if conn.execute('SELECT 1 FROM lm_entities WHERE id=? AND book_id=? AND branch_id=?', (eid, book_id, branch_id)).fetchone()})
+    if fact_ids is not None:
+        fact_ids = list({resolve_fact_id(conn, book_id, fid, branch_id=branch_id) for fid in fact_ids if conn.execute('SELECT 1 FROM lm_facts WHERE id=? AND book_id=? AND branch_id=?', (fid, book_id, branch_id)).fetchone()})
     if not ids and not fact_ids:
         return []
     # json_each avoids SQLite variable limits for explicit large entity lists.
     params = dict(book=book_id, branch=branch_id, boundary=boundary, instant=story_time,
                   entities=dumps(ids), role=role, pov=pov_entity_id or '', plans=int(include_author_plan),
                   facts=dumps(fact_ids) if fact_ids is not None else None)
-    rows = conn.execute(_INVALID_VERSIONS + '''SELECT e.*, f.subject_entity_id, f.predicate, f.scope, f.owner_entity_id
-      FROM lm_fact_events e JOIN lm_facts f ON f.id=e.fact_id
+    rows = conn.execute(_INVALID_VERSIONS + '''SELECT e.*, f.id AS canonical_fact_id, f.subject_entity_id, f.predicate, f.scope, f.owner_entity_id
+      FROM lm_fact_events e LEFT JOIN lm_fact_redirects r ON r.source_id=e.fact_id AND r.book_id=e.book_id AND r.branch_id=e.branch_id
+      JOIN lm_facts f ON f.id=COALESCE(r.target_id,e.fact_id)
       JOIN chapters c ON c.book_id=e.book_id AND c.number=e.source_chapter AND c.version_id=e.source_version
       WHERE e.book_id=:book AND e.branch_id=:branch AND c.status='committed'
       AND ((:facts IS NULL AND f.subject_entity_id IN (SELECT value FROM json_each(:entities)))
            OR f.id IN (SELECT value FROM json_each(:facts)))
+      AND e.id NOT IN (SELECT event_id FROM lm_event_supersessions)
       AND e.verified=1 AND e.invalidated=0 AND e.source_version NOT IN (SELECT version_id FROM invalid)
       AND e.source_chapter<=:boundary AND e.known_from_chapter<=:boundary
       AND e.story_valid_from<=:instant AND (e.story_valid_to IS NULL OR :instant<e.story_valid_to)
@@ -262,7 +271,8 @@ def current_state(conn, book_id, entity_ids, *, through_chapter=None, story_time
     for row in rows:
         item = dict(row)
         item['event_id'] = item.pop('id')
-        item['value'] = json.loads(item['value'])
+        item['fact_id'] = item.pop('canonical_fact_id')
+        item['value'] = canonical_value(conn, book_id, json.loads(item['value']), branch_id)
         item['source'] = dict(chapter_number=item['source_chapter'], version_id=item['source_version'], quote=item['evidence'])
         latest[item['fact_id']] = item
     return list(latest.values())
@@ -277,7 +287,7 @@ def schedule_promise(conn, book_id, label, *, due_chapter=None, triggers=(), man
     if due_chapter is not None:
         _chapter_number(due_chapter, 'due_chapter')
     if owner_entity_id:
-        _entity(conn, book_id, owner_entity_id, branch_id)
+        owner_entity_id = resolve_entity_id(conn, book_id, owner_entity_id, branch_id=branch_id)
     if source_version is not None or source_chapter is not None:
         _source(conn, book_id, source_chapter, source_version)
     trigger_list = [_text(trigger, 'trigger') for trigger in triggers]
@@ -333,7 +343,7 @@ def select_promises(conn, book_id, chapter_number, *, trigger_keys=(), explicit_
     if role not in {'reader', 'author'}:
         raise StoryError('INVALID_SCOPE', '伏笔权限无效。')
     if pov_entity_id:
-        _entity(conn, book_id, pov_entity_id, branch_id)
+        pov_entity_id = resolve_entity_id(conn, book_id, pov_entity_id, branch_id=branch_id)
     rows = conn.execute(_INVALID_VERSIONS + '''SELECT p.*, COALESCE((
         SELECT s.status FROM lm_promise_status_events s
         WHERE s.promise_id=p.id AND s.book_id=:book AND s.branch_id=:branch AND s.invalidated=0
@@ -345,7 +355,7 @@ def select_promises(conn, book_id, chapter_number, *, trigger_keys=(), explicit_
       FROM lm_promises p
       WHERE book_id=:book AND branch_id=:branch
       AND ((:role='author' AND :pov='') OR visibility='reader')
-      AND ((:role='author' AND :pov='') OR owner_entity_id='' OR owner_entity_id=:pov)
+      AND ((:role='author' AND :pov='') OR owner_entity_id='' OR COALESCE((SELECT target_id FROM lm_entity_redirects r WHERE r.book_id=p.book_id AND r.branch_id=p.branch_id AND r.source_id=p.owner_entity_id),owner_entity_id)=:pov)
       AND (source_version IS NULL OR (source_chapter<:chapter AND source_version NOT IN (SELECT version_id FROM invalid)))
       ORDER BY due_chapter,id''', dict(book=book_id, branch=branch_id, role=role,
                                      pov=pov_entity_id or '', chapter=chapter_number)).fetchall()

@@ -151,6 +151,8 @@ def _normalize(conn, book, branch, candidate):
     if set(candidate) - allowed:
         raise StoryError('INVALID_REQUEST', '候选包含不支持的字段。')
     data = dict(candidate)
+    if 'value' in data:
+        data['value'] = lm.canonical_value(conn, book, data['value'], branch)
     for field in ('subject_entity_id', 'subject_alias', 'owner_entity_id', 'scope', 'visibility', 'legacy_id'):
         if field in data and data[field] is not None:
             data[field] = _text(data[field], field, 200)
@@ -184,7 +186,7 @@ def _normalize(conn, book, branch, candidate):
     data['evidence'] = quote
     subject = data.get('subject_entity_id')
     if subject:
-        lm._entity(conn, book, _text(subject, 'subject_entity_id', 200), branch)
+        subject = lm.resolve_entity_id(conn, book, _text(subject, 'subject_entity_id', 200), branch_id=branch)
     else:
         data['subject_alias'] = _text(data.get('subject_alias'), 'subject_alias', 200)
         try:
@@ -199,7 +201,7 @@ def _normalize(conn, book, branch, candidate):
     if (scope == 'character_belief') != bool(owner):
         raise StoryError('INVALID_SCOPE', '角色信念必须指定所属实体，其他范围不可指定。')
     if owner:
-        lm._entity(conn, book, owner, branch)
+        data['owner_entity_id'] = lm.resolve_entity_id(conn, book, owner, branch_id=branch)
     for name in ('known_from_chapter', 'revealed_from_chapter'):
         if data.get(name) is not None:
             lm._chapter_number(data[name], name)
@@ -297,18 +299,29 @@ def preview_proposal(conn, book_id, proposal_id, *, branch_id='main'):
         item['source_current'] = True
     except StoryError:
         pass
+    for field in ('subject_entity_id', 'owner_entity_id'):
+        if data.get(field):
+            data[field] = lm.resolve_entity_id(conn, book_id, data[field], branch_id=branch_id)
+    data['value'] = lm.canonical_value(conn, book_id, data['value'], branch_id)
     subject = data.get('subject_entity_id')
     if not subject:
         item['identity_candidates'] = [dict(r) for r in conn.execute('''SELECT e.id,e.display_name,e.entity_type FROM lm_entities e
           JOIN lm_aliases a ON a.entity_id=e.id WHERE a.book_id=? AND a.branch_id=? AND a.alias=? ORDER BY e.id LIMIT 100''',
           (book_id, branch_id, data.get('subject_alias', '')))]
+        candidates = {}
+        for candidate in item['identity_candidates']:
+            eid = lm.resolve_entity_id(conn, book_id, candidate['id'], branch_id=branch_id)
+            candidates[eid] = dict(lm._entity(conn, book_id, eid, branch_id))
+        item['identity_candidates'] = list(candidates.values())
     else:
         scope = data.get('scope', 'objective')
         # Author review sees all scopes/visibility. POV-facing projections deliberately
         # hide author-only beliefs and therefore cannot serve as conflict detection.
         row = conn.execute(lm._INVALID_VERSIONS + """SELECT e.*,f.subject_entity_id,f.predicate,f.scope,f.owner_entity_id
-          FROM lm_fact_events e JOIN lm_facts f ON f.id=e.fact_id
+          FROM lm_fact_events e LEFT JOIN lm_fact_redirects r ON r.source_id=e.fact_id AND r.book_id=e.book_id AND r.branch_id=e.branch_id
+          JOIN lm_facts f ON f.id=COALESCE(r.target_id,e.fact_id)
           WHERE e.book_id=:book AND e.branch_id=:branch AND e.verified=1 AND e.invalidated=0
+          AND e.id NOT IN (SELECT event_id FROM lm_event_supersessions)
           AND e.source_version NOT IN (SELECT version_id FROM invalid)
           AND f.subject_entity_id=:subject AND f.predicate=:predicate AND f.scope=:scope AND f.owner_entity_id=:owner
           AND e.story_valid_from<=:instant AND (e.story_valid_to IS NULL OR :instant<e.story_valid_to)
@@ -356,7 +369,7 @@ def bind_proposal(conn, book_id, proposal_id, entity_id, *, actor, expected_revi
     if item['status'] != 'pending':
         raise StoryError('PROPOSAL_DECIDED', '候选已处理或隔离。')
     _current_source(conn, book_id, item['candidate'])
-    lm._entity(conn, book_id, entity_id, branch_id)
+    entity_id = lm.resolve_entity_id(conn, book_id, entity_id, branch_id=branch_id)
     data = item['candidate']
     data['subject_entity_id'] = entity_id
     result = {'proposal_id': proposal_id, 'entity_id': entity_id, 'revision': expected_revision + 1, 'canonical_changed': False}

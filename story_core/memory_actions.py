@@ -57,6 +57,18 @@ class MemoryActions:
             self._refresh_memory_leases(conn, book_id, result['revision'])
             return result
 
+    def memory_merge_preview(self, book_id, source_id, target_id):
+        with self.store.read() as conn:
+            return lm.preview_entity_merge(conn, book_id, source_id, target_id)
+
+    def memory_merge(self, book_id, source_id, target_id, *, conflict_resolutions, actor, expected_revision, request_id):
+        with self.store.write(book_id) as conn:
+            result = lm.merge_entities(conn, book_id, source_id, target_id,
+                conflict_resolutions=conflict_resolutions, actor=actor,
+                expected_revision=expected_revision, request_id=request_id)
+            self._refresh_memory_leases(conn, book_id, result['revision'])
+            return result
+
     def memory_maintenance(self, book_id, limit=50, offset=0):
         self.store.book(book_id)
         with self.store.read() as conn:
