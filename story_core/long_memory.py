@@ -203,8 +203,10 @@ _INVALID_VERSIONS = '''WITH RECURSIVE invalid(version_id) AS (
  WHERE v.book_id=:book AND c.version_id IS NULL
  UNION SELECT source_version FROM lm_fact_events
  WHERE book_id=:book AND branch_id=:branch AND invalidated=1
+ AND id NOT IN (SELECT event_id FROM lm_retired_events)
  UNION SELECT source_version FROM lm_promise_status_events
  WHERE book_id=:book AND branch_id=:branch AND invalidated=1 AND source_version IS NOT NULL
+ AND id NOT IN (SELECT event_id FROM lm_retired_events)
  UNION SELECT d.source_version FROM lm_dependencies d JOIN invalid i ON d.depends_on_version=i.version_id
  WHERE d.book_id=:book AND d.branch_id=:branch
 ) '''
@@ -218,8 +220,10 @@ def invalidate_version(conn, book_id, version_id, *, branch_id='main'):
        UNION SELECT d.source_version FROM lm_dependencies d JOIN affected a ON d.depends_on_version=a.version_id
        WHERE d.book_id=? AND d.branch_id=?) SELECT version_id FROM affected''',
                         (version_id, book_id, book_id, branch_id)).fetchall()
+    from .memory_repair import open_case
     total = 0
     for row in rows:
+        open_case(conn, book_id, branch_id, row[0])
         total += conn.execute('UPDATE lm_fact_events SET invalidated=1 WHERE book_id=? AND branch_id=? AND source_version=? AND invalidated=0',
                               (book_id, branch_id, row[0])).rowcount
         total += conn.execute('UPDATE lm_promise_status_events SET invalidated=1 WHERE book_id=? AND branch_id=? AND source_version=? AND invalidated=0',
