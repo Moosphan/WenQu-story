@@ -88,7 +88,7 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "project.sqlite"
         with self.connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 10:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 11:
                 raise StoryError("NEWER_DATABASE", "数据库版本高于当前程序，请升级程序。")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
@@ -111,7 +111,9 @@ class Store:
             conn.executescript(MEMORY_WORKFLOW_SCHEMA)
             from .memory_repair import SCHEMA as MEMORY_REPAIR_SCHEMA
             conn.executescript(MEMORY_REPAIR_SCHEMA)
-            conn.execute("PRAGMA user_version = 10")
+            from .settings_planning import SCHEMA as SETTINGS_PLANNING_SCHEMA
+            conn.executescript(SETTINGS_PLANNING_SCHEMA)
+            conn.execute("PRAGMA user_version = 11")
 
     def connect(self):
         conn = sqlite3.connect(self.path, timeout=20, isolation_level=None)

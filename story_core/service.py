@@ -26,6 +26,7 @@ from .memory import canonical_memory, context_layers, index_chapter, promise_obl
 from .prompts import READER_PROFILE_ORDER, instruction, reader_profile
 from .schemas import SCHEMAS, validate, word_count, length_requirement
 from .storage import Store, dumps, uid
+from . import settings_planning
 
 LEASE_SECONDS = 900
 MAX_TASK_OUTPUT_TOKENS = 12000
@@ -375,6 +376,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             if value is not None and (type(value) is not int or not low <= value <= high):
                 raise StoryError('INVALID_REQUEST', '章节数或字数超出支持范围。')
         with self.store.write(book_id, expected_revision=expected_revision) as conn:
+            settings_planning.require_idle(conn, book_id)
             book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
             last = conn.execute('SELECT COALESCE(MAX(number),0) FROM chapters WHERE book_id=?', (book_id,)).fetchone()[0]
             run = self._latest_run(conn, book_id)
@@ -392,6 +394,8 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             if brief:
                 brief['title'] = title
             replan = settings['chapter_count'] != book['settings']['chapter_count'] and bool(book['plan'])
+            if replan:
+                return settings_planning.begin(self, conn, book, run, title, settings)
             if active:
                 conn.execute("UPDATE tasks SET status='cancelled' WHERE run_id=? AND status='leased'", (run['run_id'],))
                 conn.execute("UPDATE workbench_executions SET status='cancelled',finished_at=? WHERE run_id=? AND status='running'", (time.time(), run['run_id']))
@@ -413,6 +417,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
         if not isinstance(metadata, dict):
             raise StoryError('INVALID_REQUEST', '项目资料必须是对象。')
         with self.store.write(book_id, expected_revision=expected_revision) as conn:
+            settings_planning.require_idle(conn, book_id)
             book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
             project = validate_project_metadata({**book['project'], **metadata})
             conn.execute('UPDATE books SET project=?,revision=revision+1 WHERE id=?', (dumps(project), book_id))
@@ -472,6 +477,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise StoryError('INVALID_REQUEST', '作品版本必须是非负整数。')
         with self.store.write(book_id, expected_revision=expected_revision) as conn:
+            settings_planning.require_idle(conn, book_id)
             book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
             if settings is not None and (not isinstance(settings, dict) or set(settings) - {'chapter_count', 'target_words'}):
                 raise StoryError('INVALID_REQUEST', '作品设置仅支持章节总数和后续章节字数。')
@@ -517,6 +523,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
 
     def trash_book(self, book_id):
         with self.store.write(book_id, allow_trash=True) as conn:
+            settings_planning.require_idle(conn, book_id)
             if conn.execute("SELECT 1 FROM runs WHERE book_id=? AND status='running'", (book_id,)).fetchone() or conn.execute("SELECT 1 FROM workbench_executions WHERE book_id=? AND status='running'", (book_id,)).fetchone():
                 raise StoryError('RUN_ACTIVE', '请先暂停写作并等待当前执行结束，再移入回收站。')
             conn.execute('INSERT OR IGNORE INTO book_trash VALUES (?,?)', (book_id, time.time()))
@@ -533,7 +540,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             if not conn.execute('SELECT 1 FROM book_trash WHERE book_id=?', (book_id,)).fetchone():
                 raise StoryError('DELETE_FORBIDDEN', '只能彻底删除回收站中的作品。')
             delete_semantic_book(conn, book_id)
-            for table in ('workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports', 'book_trash'):
+            for table in ('settings_planning_jobs', 'workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports', 'book_trash'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
         purge_semantic_files(self.store, book_id)
@@ -565,7 +572,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             if conn.execute("SELECT 1 FROM runs WHERE book_id=? AND status IN ('running','paused','needs_attention','awaiting_author')", (book_id,)).fetchone():
                 raise StoryError('RUN_ACTIVE', '请先结束该样例的进行中任务。')
             delete_semantic_book(conn, book_id)
-            for table in ('workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports'):
+            for table in ('settings_planning_jobs', 'workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
         purge_semantic_files(self.store, book_id)
@@ -630,6 +637,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             return {'book_id': book_id, 'imported': len(added), 'revision': revision, 'chapters': added, 'reviewed': False}
 
     def _insert_run(self, conn, book, chapter_limit, max_steps, max_revisions, budget_tokens, *, candidate=None, chapter=None, review_mode='bounded'):
+        settings_planning.require_idle(conn, book['book_id'])
         if review_mode not in ('bounded','legacy'):
             raise StoryError('INVALID_REQUEST','审稿模式无效。')
         for name, value, low, high in [('max_steps',max_steps,1,10000),('max_revisions',max_revisions,0,10),('budget_tokens',budget_tokens,1,100000000)]:
@@ -887,6 +895,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
         self.store.event(conn,run['book_id'],'needs_attention',{'reason':reason},run['run_id'])
 
     def _task_spec(self, conn, book, run, policy=None, retrieval_query=None):
+        book = settings_planning.virtual_book(conn, book)
         policy = policy or ContextPolicy.from_env(run['stage'], self.store.root / 'context-policy.json')
         data=self._input(conn,book,run,policy,retrieval_query)
         schema = adjudication_schema(data['review_adjudication']) if data.get('review_adjudication') else REPAIR_SCHEMA if data.get('extraction_repair') else review_source_schema(run['candidate']) if run['stage'] == 'continuity' else SCHEMAS[run['stage']]
@@ -1196,6 +1205,8 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             if book['revision']!=task['base_revision']:
                 raise StoryError('STALE_REVISION','作品已修改，拒绝旧上下文结果。')
             stage=task['stage']
+            planning_job = settings_planning.pending(conn, book['book_id'])
+            book = settings_planning.virtual_book(conn, book)
             processing_result, warning = validate_output(stage, result, book, run['candidate'], json.loads(task['input']))
             if warning:
                 self.store.event(conn, book['book_id'], 'supplement_rejected',
@@ -1210,10 +1221,15 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
                     self.store.event(conn, book['book_id'], 'outline_batch_completed', inputs['outline_batch'], run['run_id'])
                 if complete:
                     conn.execute(f'UPDATE books SET {field}=?,revision=revision+1 WHERE id=?',(dumps(published),book['book_id']))
+                    if planning_job:
+                        conn.execute('UPDATE books SET title=?,config=?,brief=?,ending=NULL WHERE id=?',
+                            (book['title'], dumps(book['settings']), dumps(book['brief']), book['book_id']))
                 if stage=='brief' and book['title']=='未命名作品':
                     conn.execute('UPDATE books SET title=? WHERE id=?',(result['title'],book['book_id']))
                 requested_revision = any(review.get('stage') == 'author' for review in run['reviews'] or [])
                 self._set_stage(conn,run,'outline' if stage=='brief' or not complete else 'revise' if requested_revision else 'extract' if run['candidate'] else 'draft')
+                if complete and planning_job:
+                    settings_planning.finish(self, conn, planning_job, book, run)
             elif stage in ('draft','revise'):
                 conn.execute("UPDATE runs SET candidate=?,extraction=NULL,reviews='[]',stage='extract' WHERE id=?",(dumps({'title': result['title'], 'body': result['body']}),run['run_id']))
             elif stage=='extract':
@@ -1430,7 +1446,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
                     'chapters':counts,'target_chapters':book['settings']['chapter_count'],'run':run,'events':events,
                     'token_usage': token_usage, 'blocker': blocker, 'context_usage': context_usage(conn, book_id),
                     'active_task': dict(active_task) if active_task else None,
-                    'execution':execution,
+                    'execution':execution, 'settings_planning': settings_planning.public(conn, book, run),
                     'budget_note':'tokens 为保守预留量，含重领任务；不是服务商账单。'}
 
     def control(self,book_id,action,**options):
@@ -1441,6 +1457,28 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
         with self.store.write(book_id, expected_revision=expected_revision) as conn:
             book=self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?',(book_id,)).fetchone())
             run=self._latest_run(conn,book_id)
+            job = settings_planning.pending(conn, book_id)
+            if action == 'adopt_planning':
+                if not run or run['stage'] != 'outline' or run['status'] not in ('paused', 'needs_attention'):
+                    raise StoryError('INVALID_STATE', '没有可接管的历史规划断点。')
+                return settings_planning.begin(self, conn, book, run, book['title'], book['settings'], adopt=True)
+            if job:
+                if action == 'cancel_planning':
+                    settings_planning.finish(self, conn, job, book, run, cancelled=True)
+                    return self._latest_run(conn, book_id)
+                if action == 'resume_planning':
+                    for key in ('budget_tokens', 'max_steps'):
+                        if key in options:
+                            value = options[key]
+                            if type(value) is not int or not 1 <= value <= 100000000:
+                                raise StoryError('INVALID_REQUEST', '预算无效。')
+                            conn.execute(f'UPDATE runs SET {key}=? WHERE id=?', (value, run['run_id']))
+                    conn.execute("UPDATE runs SET status='running',reason=NULL WHERE id=?", (run['run_id'],))
+                    conn.execute("UPDATE books SET status='planning' WHERE id=?", (book_id,))
+                    return self._latest_run(conn, book_id)
+                raise StoryError('PLANNING_ACTIVE', '这是独立设置规划；请使用继续规划或取消规划，完成后再启动章节写作。')
+            if action in ('resume_planning', 'cancel_planning'):
+                raise StoryError('INVALID_STATE', '没有待处理的设置规划。')
             if action=='approve_chapter':
                 number=options.get('chapter_number');version=options.get('version_id')
                 current=conn.execute('SELECT version_id FROM chapters WHERE book_id=? AND number=?',(book_id,number)).fetchone()

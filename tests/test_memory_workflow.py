@@ -360,7 +360,7 @@ def test_newer_schema_guard_and_workflow_book_cascade(world):
         assert conn.execute('SELECT count(*) FROM lm_proposals').fetchone()[0] == 0
         assert conn.execute('SELECT count(*) FROM lm_source_digests').fetchone()[0] == 0
         assert conn.execute('PRAGMA foreign_key_check').fetchall() == []
-        conn.execute('PRAGMA user_version=11')
+        conn.execute('PRAGMA user_version=12')
     with pytest.raises(StoryError) as error:
         Store(store.root)
     assert error.value.code == 'NEWER_DATABASE'

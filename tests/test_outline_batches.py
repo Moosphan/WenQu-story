@@ -41,7 +41,6 @@ def test_expansion_keeps_candidate_and_published_plan_until_all_batches_finish(t
         conn.execute('UPDATE runs SET chapter_number=20 WHERE book_id=?', (book,))
     before = service.get_book(book)
     service.update_book_settings(book, chapter_count=200)
-    service.control(book, 'resume')
     for start in range(21, 201, 20):
         task = service.next_task(book)
         assert task['input']['outline_batch']['start'] == start
@@ -54,6 +53,8 @@ def test_expansion_keeps_candidate_and_published_plan_until_all_batches_finish(t
     assert after['plan']['chapters'][:20] == before['plan']['chapters'][:20]
     assert len(after['plan']['chapters']) == 200
     assert response['next_stage'] == 'extract'
+    assert not service.next_task(book).get('task_id')
+    service.control(book, 'resume')
     assert service.next_task(book)['input']['candidate']['body'] == result_for({'stage': 'draft'})['body']
 
 

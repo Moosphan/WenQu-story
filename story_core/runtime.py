@@ -91,6 +91,13 @@ class WorkbenchRuntime:
                 self.store.event(conn, session['book_id'], 'worker_interrupted', {'execution_id': session['id'], **error,
                                 'stage': run['stage'] if run else None, 'chapter_number': run['chapter_number'] if run else None}, session['run_id'])
 
+            # Saving settings can commit before the dispatch thread reserves a
+            # worker. Such jobs have no execution row for the loop above.
+            for job in conn.execute("SELECT j.book_id,j.run_id FROM settings_planning_jobs j JOIN runs r ON r.id=j.run_id WHERE j.status='pending' AND r.status='running'").fetchall():
+                live_lease = conn.execute("SELECT 1 FROM tasks WHERE run_id=? AND status='leased' AND lease_until>?", (job['run_id'], time.time())).fetchone()
+                if not live_lease:
+                    conn.execute("UPDATE runs SET status='paused',reason=? WHERE id=?", ('服务已重启，设置规划进度已保留，请继续规划。', job['run_id']))
+
     def latest(self, book_id):
         with self.store.read() as conn:
             row = conn.execute('SELECT * FROM workbench_executions WHERE book_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1', (book_id,)).fetchone()

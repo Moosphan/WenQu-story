@@ -1,7 +1,7 @@
 const element = id => document.getElementById(id);
 const state = { book: null, chapter: null, task: null, api: false, executor: 'manual', worker: false, dirty: false, books: [], reviews: [], candidateVersions: [], facets: {}, memoryFacet: '全部', versions: [], status: null, selection: 0, polling: false, busy: new Set(), editRevision: null, marketSources: new Set(), marketSelectionInitialized: false, aiConfig: null, activeView: 'overview', reviewView: 'reviews', focused: false, tts: { request: 0, objectUrl: '', key: '', playing: false }, ttsVoices: [] };
 let memoryOffset = 0;
-const statuses = { awaiting_author: '等待作者确认', new: '新作品', imported: '导入待审', writing: '写作中', running: '进行中', paused: '已暂停', needs_attention: '需要处理', complete: '已完结', draft: '未完稿', batch_complete: '本轮完成', cancelled: '已结束' };
+const statuses = { planning: '设置规划中', awaiting_author: '等待作者确认', new: '新作品', imported: '导入待审', writing: '写作中', running: '进行中', paused: '已暂停', needs_attention: '需要处理', complete: '已完结', draft: '未完稿', batch_complete: '本轮完成', cancelled: '已结束' };
 const stages = { brief: '建立创作约定', outline: '规划全书', draft: '写作正文', extract: '提取故事记忆', continuity: '核对连续性', reader: '读者审稿', arc: '故事弧审校', revise: '修改候选稿', ending: '全书完结审查', human: '真人反馈' };
 const readerProfiles = { target_reader: '目标题材读者', logic_reader: '逻辑敏感读者' };
 const events = { worker_started: '执行器启动', worker_finished: '执行器结束', worker_interrupted: '服务中断，保存恢复点', run_started: '启动写作批次', task_leased: '领取任务', task_submitted: '提交处理结果', chapter_committed: '章节通过并写入定稿', chapters_imported: '导入待审正文', revision_requested: '创建作者返修', human_feedback_submitted: '保存真人反馈', project_metadata_updated: '更新项目资料', provider_usage: '完成模型调用', worker_failed: '执行中断', book_completed: '全书审查完成', needs_attention: '等待作者处理', pause: '暂停任务', resume: '恢复任务', cancel: '结束本轮任务', book_kind_changed: '修改作品类型', project_archived: '归档作品', project_restored: '恢复归档作品' };
@@ -176,9 +176,19 @@ function controls() {
   element('get-task').hidden = Boolean(state.worker);
   const conditions = { continue: !state.book || archived || state.status?.status === 'complete' || state.status?.worker_running, pause: !active || run.status === 'paused', cancel: !active, export: state.status?.status !== 'complete', 'save-revision': !state.chapter || !state.dirty || !revisionUnlocked, 'request-revision': !state.chapter || !revisionUnlocked, 'get-task': !active || run.status !== 'running', 'submit-task': !state.task?.task_id, 'submit-human-feedback': !state.chapter || state.chapter.status !== 'committed', 'import-chapters': Boolean(active) || archived, 'edit-story-bible': !state.book?.brief || !state.book?.plan };
   for (const [id, disabled] of Object.entries(conditions)) element(id).disabled = disabled || state.busy.has(id);
+  if (state.status?.settings_planning) {
+    for (const id of ['continue', 'pause', 'cancel', 'request-revision', 'save-revision', 'edit-story-bible', 'open-book-settings', 'edit-project-material', 'review-chapter', 'approve-chapter']) element(id).disabled = true;
+  } else {
+    for (const id of ['open-book-settings', 'edit-project-material']) element(id).disabled = state.busy.has(id);
+  }
   element('revision-feedback').disabled = !revisionUnlocked;
   element('batch-size').disabled = Boolean(active);
   renderSelectedChapter();
+  if (state.status?.settings_planning) {
+    element('review-chapter').disabled = true;
+    element('approve-chapter').disabled = true;
+    element('selected-action-hint').textContent = '作品设置正在独立规划；当前正文与候选稿保留，完成后可单独继续写作。';
+  }
 }
 function action(id, handler) {
   element(id).addEventListener('click', async () => {
@@ -998,6 +1008,20 @@ function renderStatus() {
   renderExecutionSummary();
   renderEvents(); renderUsage();
   if (run) { element('budget-tokens').placeholder = String(run.budget_tokens); element('max-steps').placeholder = String(run.max_steps); }
+  const planning = status.settings_planning;
+  element('settings-planning-panel').hidden = !planning;
+  element('execution-summary').hidden = Boolean(planning);
+  element('pipeline').hidden = Boolean(planning);
+  if (planning) {
+    element('settings-planning-detail').textContent = `目标 ${planning.target_settings.chapter_count} 章 · 已规划 ${planning.planned_chapters} 章。${planning.reason || (status.worker_running ? '正在后台规划…' : planning.status === 'running' ? '正在启动规划…' : '规划已保留，可继续或取消。')}`;
+    element('resume-planning').hidden = planning.status === 'running' || status.worker_running;
+    element('progress-title').textContent = '作品设置规划';
+    element('progress-detail').textContent = '规划与章节生成分开执行';
+    element('progress').max = planning.target_settings.chapter_count;
+    element('progress').value = planning.planned_chapters;
+    element('continue').textContent = '规划完成后可继续章节写作';
+    element('reason').textContent = planning.reason || '后台规划会逐批保存；离开页面不影响执行。可取消规划以保留原配置，也可在中断后继续规划。';
+  }
   controls();
 }
 function eventCategory(event) { return ['revision_requested', 'chapter_committed', 'human_feedback_submitted', 'needs_attention'].includes(event.kind) || event.payload.stage === 'reader' || event.payload.stage === 'continuity' ? 'review' : 'execution'; }
@@ -1037,6 +1061,7 @@ async function refreshStatus() {
   } finally { state.polling = false; }
 }
 async function continueWriting() {
+  if (state.status?.settings_planning) { notice('请先完成或取消作品设置规划，再继续章节写作。'); return; }
   if (!state.book) return;
   const capabilities = await api('/api/capabilities');
   state.api = capabilities.api_configured; state.worker = capabilities.worker_configured; state.executor = capabilities.executor;
@@ -1334,7 +1359,7 @@ function bind() {
       }, 'PATCH');
       closeDialog('book-settings-dialog'); state.task = null;
       await selectBook(saved.book_id);
-      notice(`作品设置已保存，原有正文保留。${saved.replan ? '继续写作时将先调整后续规划。' : ''}${saved.run_paused ? '当前任务已暂停，请继续写作以使用新设置。' : ''}`);
+      notice(saved.planning_pending ? '已启动独立规划；完成后应用新设置。可离开页面，或取消规划以保留原配置。' : `作品设置已保存，原有正文保留。${saved.run_paused ? '当前任务已暂停，请继续写作以使用新设置。' : ''}`);
     } catch (error) { element('book-settings-error').textContent = error.message; }
     finally { button.disabled = false; }
   });
@@ -1365,6 +1390,11 @@ function bind() {
     finally { state.busy.delete(button.id); controls(); }
   });
   for (const name of ['pause', 'cancel']) action(name, async () => { await api(`/api/books/${state.book.book_id}/control`, { action: name }); state.task = null; renderContextInspector(null); await refreshStatus(); });
+  for (const [id, operation] of [['resume-planning', 'resume_planning'], ['cancel-planning', 'cancel_planning']]) action(id, async () => {
+    await api(`/api/books/${state.book.book_id}/control`, {action: operation, options: operation === 'resume_planning' ? budgetOptions(element('budget-tokens').value, element('max-steps').value) : {}});
+    await refreshStatus();
+    notice(operation === 'cancel_planning' ? '已取消规划，原配置和正式章纲保留。' : '正在继续独立规划。');
+  });
   element('book-search').addEventListener('input', renderShelf);
   element('genre-library-search').addEventListener('input', renderGenreLibrary);
   element('project-genres').addEventListener('input', renderGenreLibrary);

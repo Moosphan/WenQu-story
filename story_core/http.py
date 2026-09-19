@@ -3,6 +3,7 @@ import json
 import os
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -272,6 +273,40 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
     active = {}
     idea_active = {}
     lock = threading.Lock()
+    planning_dispatch = set()
+
+    def dispatch_planning(book_id):
+        # A previous writing child may still be shutting down. Queue the planning
+        # worker behind it instead of silently treating that old child as this job.
+        with lock:
+            if book_id in planning_dispatch:
+                return
+            planning_dispatch.add(book_id)
+        def launch():
+            try:
+                for _ in range(150):
+                    with lock:
+                        waiting = book_id in active
+                    if not waiting:
+                        break
+                    time.sleep(.2)
+                else:
+                    raise StoryError('WORKER_STOPPING', '旧任务仍在退出，稍后点击继续规划。')
+                status = service.status(book_id)
+                if status.get('settings_planning') and status['run']['status'] == 'running':
+                    worker(book_id)
+            except Exception as exc:
+                message = exc.message if isinstance(exc, StoryError) else '规划执行器启动失败，请检查 AI 配置后继续规划。'
+                with service.store.write(book_id) as conn:
+                    from .settings_planning import pending
+                    job = pending(conn, book_id)
+                    if job:
+                        conn.execute("UPDATE runs SET status='paused',reason=? WHERE id=?", (message, job['run_id']))
+                        service.store.event(conn, book_id, 'settings_planning_start_failed', {'message': message}, job['run_id'])
+            finally:
+                with lock:
+                    planning_dispatch.discard(book_id)
+        threading.Thread(target=launch, daemon=True).start()
 
     @app.middleware('http')
     async def same_origin(request: Request, call_next):
@@ -373,7 +408,10 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
 
     @app.patch('/api/books/{book_id}/settings')
     def update_settings(book_id: str, body: BookSettingsRequest):
-        return service.update_book_settings(book_id, **body.model_dump())
+        result = service.update_book_settings(book_id, **body.model_dump())
+        if result.get('planning_pending'):
+            dispatch_planning(book_id)
+        return result
 
     @app.get('/api/books/{book_id}/status')
     def status(book_id: str):
@@ -472,7 +510,10 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
 
     @app.post('/api/books/{book_id}/control')
     def control(book_id: str, body: ControlRequest):
-        return service.control(book_id,body.action,**body.options)
+        result = service.control(book_id,body.action,**body.options)
+        if body.action in ('resume_planning', 'adopt_planning'):
+            dispatch_planning(book_id)
+        return result
 
     @app.post('/api/books/{book_id}/next')
     def next_task(book_id: str, body: NextRequest):

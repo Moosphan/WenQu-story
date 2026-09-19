@@ -25,9 +25,8 @@ def test_completed_book_expansion_reopens_without_overwriting_chapters(tmp_path)
     finish(service, bid)
     before = service.get_book(bid)['chapters']
     service.update_book_settings(bid, chapter_count=2)
-    assert service.get_book(bid)['status'] == 'draft'
+    assert service.get_book(bid)['status'] == 'planning'
     assert service.get_book(bid)['chapters'] == before
-    service.start_run(bid)
     assert service.next_task(bid)['stage'] == 'outline'
 
 
@@ -58,7 +57,7 @@ def test_settings_preserve_checkpoint_and_request_replanning(tmp_path):
     task = service.next_task(book_id)
     service.update_book_settings(book_id, chapter_count=5, target_words=100)
     run = service.status(book_id)['run']
-    assert run['status'] == 'paused'
+    assert run['status'] == 'running'
     assert run['chapter_number'] == 1
     assert run['stage'] == 'outline'
     with service.store.read() as conn:

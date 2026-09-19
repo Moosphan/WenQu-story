@@ -37,7 +37,8 @@ def progress(conn, book, run):
 
 
 def prepare(conn, book, run, data):
-    if book['settings']['chapter_count'] <= 40:
+    from .settings_planning import pending
+    if book['settings']['chapter_count'] <= 40 and not pending(conn, book['book_id']):
         return
     assembled, seed = progress(conn, book, run)
     start = len(assembled['chapters']) + 1
