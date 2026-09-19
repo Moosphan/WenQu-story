@@ -219,6 +219,37 @@ def canonical_memory(conn, book_id, through_chapter):
     return list(latest.values())
 
 
+def selected_canonical_memory(conn, book_id, through_chapter, *, kinds, limit=None):
+    """Project selected legacy kinds in SQL before materializing JSON.
+
+    Mandatory promise rows have no limit; latest status is selected before any
+    status filtering so a settled obligation cannot resurrect an older event.
+    The SQL still visits matching kind history; this is not an O(1) claim.
+    """
+    query = '''WITH ranked AS (
+        SELECT m.*, ROW_NUMBER() OVER (
+            PARTITION BY m.kind,m.key,COALESCE(json_extract(m.data,'$.owner'),'')
+            ORDER BY m.chapter_number DESC,m.rowid DESC) AS position
+        FROM memories m JOIN chapters c ON c.book_id=m.book_id
+            AND c.number=m.chapter_number AND c.version_id=m.version_id
+        WHERE m.book_id=? AND m.chapter_number<=? AND c.status='committed'
+            AND m.kind IN (SELECT value FROM json_each(?)))
+        SELECT * FROM ranked WHERE position=1 ORDER BY chapter_number DESC,id'''
+    params = [book_id, through_chapter, dumps(kinds)]
+    if limit is not None:
+        if type(limit) is not int or not 1 <= limit <= 64:
+            raise StoryError('INVALID_REQUEST', '可选记忆数量应为 1–64。')
+        query += ' LIMIT ?'
+        params.append(limit)
+    result = []
+    for row in conn.execute(query, params):
+        item = json.loads(row['data'])
+        item['id'] = row['id']
+        item['source'] = {'chapter_number': row['chapter_number'], 'version_id': row['version_id'], 'quote': row['evidence']}
+        result.append(item)
+    return result
+
+
 def bounded_context_layers(memories, chapter_plan, chapter_number, supplement_limit=8, *,
                            current_facts=(), scheduled_promises=()):
     """Opt-in candidate selection; ContextCompiler applies final token budgets.

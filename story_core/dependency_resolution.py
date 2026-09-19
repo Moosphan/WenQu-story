@@ -35,6 +35,11 @@ def resolve_dependencies(conn, book_id, plan, stage, chapter_number, *, role, po
     if 'story_time' in plan:
         result['state'] = current_state(conn, book_id, [], fact_ids=requested, story_time=plan['story_time'],
             through_chapter=boundary, role=role, pov_entity_id=pov_entity_id)
+    for item in result['state']:
+        item['identity_aliases'] = [row[0] for row in conn.execute(
+            'SELECT source_id FROM lm_fact_redirects WHERE book_id=? AND branch_id=? AND target_id=?',
+            (book_id, 'main', item['fact_id']))]
+        item['context_reason'] = 'explicit_dependency'
     return result
 
 
@@ -45,7 +50,7 @@ def attach_dependencies(data, resolved):
 
     keys = {source_key(item) for item in resolved['evidence']}
     if keys:
-        for layer in ('required_memory', 'supplementary_memory', 'reader_memory'):
+        for layer in ('required_memory', 'supplementary_memory', 'reader_memory', 'historical_evidence'):
             if layer in data:
                 data[layer] = [item for item in data[layer] if source_key(item) not in keys]
         data.setdefault('required_memory', []).extend(resolved['evidence'])

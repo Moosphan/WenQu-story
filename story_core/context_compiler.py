@@ -122,10 +122,11 @@ def _ids(item):
 
 
 def _stable_ids(item):
-    return {str(item[key]) for key in ('id', 'fact_id', 'promise_id') if item.get(key)}
+    return {str(item[key]) for key in ('id', 'fact_id', 'promise_id') if item.get(key)} | set(item.get('identity_aliases', []))
 
 
 def _layer(key):
+    if key == 'semantic_summaries': return 'summary'
     if key in ('brief', 'request', 'project', 'title', 'settings'): return 'core'
     if key in ('chapter_plan', 'arc_window', 'plan', 'arc_plan'): return 'plan'
     if key in ('current_state', 'required_memory', 'pov_context'): return 'state'
@@ -170,7 +171,7 @@ def organize(data, selection=None, *, stage='draft'):
             add('supplementary_memory', item, 50)
     if required:
         core['required_memory'] = required
-    for key in ('supplementary_memory', 'reader_memory', 'existing_memory_keys', 'historical_evidence'):
+    for key in ('supplementary_memory', 'reader_memory', 'existing_memory_keys', 'historical_evidence', 'semantic_summaries'):
         for index, item in enumerate(core.pop(key, [])):
             if key == 'historical_evidence' and core.get('lookup_result') and index == 0:
                 # The top requested source may borrow soft quota; never spend a

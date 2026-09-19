@@ -10,8 +10,17 @@ import json
 from pathlib import Path
 import uuid
 import fcntl
+import shutil
 
 from .errors import StoryError
+
+
+def validate_policy(policy):
+    if not isinstance(policy, dict) or policy.get('strategy') not in ('lexical', 'semantic', 'hybrid'):
+        raise StoryError('INVALID_RETRIEVAL_POLICY', '检索策略必须是 lexical、semantic 或 hybrid。')
+    if set(policy) - {'strategy', 'model_path', 'model_fingerprint'}:
+        raise StoryError('INVALID_RETRIEVAL_POLICY', '检索配置含未知字段。')
+    return policy
 
 
 def load_policy(store):
@@ -20,13 +29,11 @@ def load_policy(store):
         policy = json.loads(path.read_text()) if path.exists() else {'strategy': 'lexical'}
     except (OSError, ValueError) as exc:
         raise StoryError('INVALID_RETRIEVAL_POLICY', '检索配置无法读取。') from exc
-    if not isinstance(policy, dict) or policy.get('strategy') not in ('lexical', 'semantic', 'hybrid'):
-        raise StoryError('INVALID_RETRIEVAL_POLICY', '检索策略必须是 lexical、semantic 或 hybrid。')
-    return policy
+    return validate_policy(policy)
 
 
 def configure_retrieval(store, config):
-    policy = dict(config)
+    policy = dict(validate_policy(config))
     if policy.get('strategy') not in ('lexical', 'semantic', 'hybrid'):
         raise StoryError('INVALID_RETRIEVAL_POLICY', '无效检索策略。')
     if policy['strategy'] != 'lexical':
@@ -89,6 +96,24 @@ def _schema(conn):
         PRIMARY KEY(book_id,fingerprint,memory_id), UNIQUE(book_id,fingerprint,label))''')
 
 
+def delete_semantic_book(conn, book_id):
+    """Remove optional semantic metadata in the caller's book-deletion transaction."""
+    for table in ('semantic_vectors', 'semantic_partitions', 'semantic_pending'):
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
+
+
+def purge_semantic_files(store, book_id):
+    """After book deletion commits, remove its generations without following links."""
+    parent = store.root / 'semantic-indexes'
+    folder = parent / hashlib.sha256(book_id.encode()).hexdigest()
+    if (parent.is_symlink() or folder.is_symlink() or not folder.is_dir()
+            or parent.resolve().parent != store.root.resolve()
+            or folder.resolve().parent != parent.resolve()):
+        return
+    shutil.rmtree(folder)
+
+
 def _vectors(values):
     import numpy as np
     array = np.asarray(values, dtype='float32')
@@ -124,6 +149,18 @@ class LocalSemanticAdapter:
             present = conn.execute("SELECT 1 FROM sqlite_master WHERE name='semantic_partitions'").fetchone()
             row = conn.execute('SELECT * FROM semantic_partitions WHERE book_id=? AND fingerprint=?', (scope.book_id, query.fingerprint)).fetchone() if present else None
             if row is None:
+                # A first chapter (or a fully filtered scope) has no evidence to
+                # index. Missing partitions are actionable only for eligible rows.
+                eligible = conn.execute('''SELECT 1 FROM memories m JOIN chapters c
+                    ON c.book_id=m.book_id AND c.number=m.chapter_number AND c.version_id=m.version_id
+                    WHERE m.book_id=:book AND m.chapter_number<=:boundary AND c.status='committed'
+                    AND (:role='author' OR m.visibility='reader')
+                    AND (:pov='' OR (m.visibility='reader' AND
+                         (m.kind!='knowledge' OR json_extract(m.data,'$.owner')=:pov)))
+                    LIMIT 1''', {'book': scope.book_id, 'boundary': scope.through_chapter,
+                                 'role': scope.role, 'pov': scope.pov or ''}).fetchone()
+                if eligible is None:
+                    return []
                 raise StoryError('SEMANTIC_INDEX_UNAVAILABLE', '此作品和模型尚未维护本地语义索引。')
             if len(query.vector) != row['dimension']:
                 raise StoryError('SEMANTIC_DIMENSION_CHANGED', '模型向量维度与索引不一致。')
@@ -168,7 +205,8 @@ def maintain_semantic_index(store, book_id, *, batch_size=32):
             from .retrieval import initialize_index
             initialize_index(conn)
             _schema(conn)
-        while True:
+        # A maintenance request performs one bounded batch; callers explicitly resume.
+        for _ in range(1):
             with store.read() as conn:
                 rows = conn.execute('''SELECT m.id,m.version_id,m.key,m.value FROM memories m
                     JOIN chapters c ON c.book_id=m.book_id AND c.number=m.chapter_number AND c.version_id=m.version_id
@@ -209,4 +247,12 @@ def maintain_semantic_index(store, book_id, *, batch_size=32):
                     total += 1
                 conn.execute('INSERT OR REPLACE INTO semantic_partitions VALUES (?,?,?,?,?)',
                     (book_id, fingerprint, dimension, str(path), start + len(rows)))
-    return {'indexed': total, 'stale_skipped': skipped, 'model_fingerprint': fingerprint}
+    with store.read() as conn:
+        remaining = conn.execute('''SELECT COUNT(*) FROM memories m JOIN chapters c
+            ON c.book_id=m.book_id AND c.number=m.chapter_number AND c.version_id=m.version_id
+            WHERE m.book_id=? AND c.status='committed' AND NOT EXISTS
+            (SELECT 1 FROM semantic_vectors v WHERE v.book_id=m.book_id AND v.fingerprint=?
+             AND v.memory_id=m.id AND v.source_version=m.version_id AND v.indexed_status='ready')''',
+            (book_id, fingerprint)).fetchone()[0]
+    return {'indexed': total, 'stale_skipped': skipped, 'remaining': remaining,
+            'model_fingerprint': fingerprint}

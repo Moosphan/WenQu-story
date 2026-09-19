@@ -1,5 +1,6 @@
 """Source-preserving entity identity and explicit, audited merge decisions."""
 import hashlib
+import json
 from itertools import combinations
 from .errors import StoryError
 from .storage import dumps
@@ -42,13 +43,16 @@ def resolve_fact_id(conn, book_id, fact_id, *, branch_id='main'):
     return _resolve(conn,book_id,branch_id,fact_id,'fact')
 
 
-def canonical_value(conn, book, value, branch='main'):
+def canonical_value(conn, book, value, branch='main', *, proposed_source=None, proposed_target=None):
     """Only explicitly typed entity references are identity-bearing values."""
-    if isinstance(value, list): return [canonical_value(conn,book,x,branch) for x in value]
+    options = {'proposed_source': proposed_source, 'proposed_target': proposed_target}
+    if isinstance(value, list): return [canonical_value(conn,book,x,branch, **options) for x in value]
     if not isinstance(value, dict): return value
-    result = {k: canonical_value(conn,book,v,branch) for k,v in value.items()}
+    result = {k: canonical_value(conn,book,v,branch, **options) for k,v in value.items()}
     if value.get('type') == 'entity' and isinstance(value.get('entity_id'), str):
         result['entity_id'] = resolve_entity_id(conn,book,value['entity_id'],branch_id=branch)
+        if result['entity_id'] == proposed_source:
+            result['entity_id'] = proposed_target
     return result
 
 
@@ -73,12 +77,17 @@ def preview_entity_merge(conn, book_id, source_id, target_id, *, branch_id='main
             affected.append(row['id'])
             groups.setdefault(_key(conn,book_id,branch_id,row,source,target),[]).append(row['id'])
     conflicts = []
+    invalid_versions = {row[0] for row in conn.execute(lm._INVALID_VERSIONS + 'SELECT version_id FROM invalid',
+                                                      {'book': book_id, 'branch': branch_id})}
     for ids in groups.values():
         events = conn.execute('''SELECT * FROM lm_fact_events WHERE fact_id IN (SELECT value FROM json_each(?))
             AND invalidated=0 AND verified=1 AND id NOT IN (SELECT event_id FROM lm_event_supersessions)''',(dumps(ids),)).fetchall()
         for a,b in combinations(events,2):
+            if a['source_version'] in invalid_versions or b['source_version'] in invalid_versions: continue
             if resolve_fact_id(conn,book_id,a['fact_id'],branch_id=branch_id) == resolve_fact_id(conn,book_id,b['fact_id'],branch_id=branch_id): continue
-            if a['value'] == b['value']: continue
+            values = [canonical_value(conn, book_id, json.loads(event['value']), branch_id,
+                proposed_source=source, proposed_target=target) for event in (a, b)]
+            if json.dumps(values[0], sort_keys=True) == json.dumps(values[1], sort_keys=True): continue
             if max(a['story_valid_from'],b['story_valid_from']) >= min(a['story_valid_to'] if a['story_valid_to'] is not None else float('inf'),b['story_valid_to'] if b['story_valid_to'] is not None else float('inf')): continue
             pair = sorted([a['id'],b['id']])
             conflicts.append({'id': '|'.join(pair), 'event_ids': pair, 'events': [dict(a),dict(b)], 'resolution_effect': 'losing_event_superseded_entire_interval'})

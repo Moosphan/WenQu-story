@@ -223,7 +223,16 @@ def invalidate_version(conn, book_id, version_id, *, branch_id='main'):
     from .memory_repair import open_case
     total = 0
     for row in rows:
-        open_case(conn, book_id, branch_id, row[0])
+        conn.execute('''UPDATE lm_semantic_summaries SET status='stale' WHERE book_id=?
+            AND status='accepted' AND EXISTS (SELECT 1 FROM json_each(sources) ref
+                WHERE json_extract(ref.value,'$.version_id')=?)''', (book_id, row[0]))
+        pending = conn.execute('''SELECT 1 FROM lm_fact_events WHERE book_id=? AND branch_id=?
+            AND source_version=? AND id NOT IN (SELECT event_id FROM lm_retired_events)
+            UNION ALL SELECT 1 FROM lm_promise_status_events WHERE book_id=? AND branch_id=?
+            AND source_version=? AND id NOT IN (SELECT event_id FROM lm_retired_events) LIMIT 1''',
+            (book_id, branch_id, row[0], book_id, branch_id, row[0])).fetchone()
+        if pending:
+            open_case(conn, book_id, branch_id, row[0])
         total += conn.execute('UPDATE lm_fact_events SET invalidated=1 WHERE book_id=? AND branch_id=? AND source_version=? AND invalidated=0',
                               (book_id, branch_id, row[0])).rowcount
         total += conn.execute('UPDATE lm_promise_status_events SET invalidated=1 WHERE book_id=? AND branch_id=? AND source_version=? AND invalidated=0',
@@ -284,12 +293,33 @@ def current_state(conn, book_id, entity_ids, *, through_chapter=None, story_time
 
 def schedule_promise(conn, book_id, label, *, due_chapter=None, triggers=(), mandatory=False,
                      promise_id=None, status='dormant', visibility='author', owner_entity_id=None,
-                     source_chapter=None, source_version=None, branch_id='main', data=None):
+                     source_chapter=None, source_version=None, branch_id='main', data=None,
+                     due_from_chapter=None, due_to_chapter=None, relation_triggers=()):
     _book(conn, book_id, branch_id)
     if status not in {'dormant', 'active', 'due', 'resolved', 'cancelled'} or visibility not in {'reader', 'author'}:
         raise StoryError('INVALID_REQUEST', '伏笔状态或可见性无效。')
     if due_chapter is not None:
         _chapter_number(due_chapter, 'due_chapter')
+    if due_from_chapter is not None or due_to_chapter is not None:
+        _chapter_number(due_from_chapter, 'due_from_chapter')
+        _chapter_number(due_to_chapter, 'due_to_chapter')
+        if due_to_chapter < due_from_chapter or (due_chapter is not None and due_chapter != due_to_chapter):
+            raise StoryError('INVALID_REQUEST', '伏笔回收区间无效；兼容到期章须为区间末端。')
+        due_chapter = due_to_chapter
+    if not isinstance(relation_triggers, (list, tuple)) or len(relation_triggers) > 16:
+        raise StoryError('INVALID_REQUEST', '关系触发条件至多 16 项。')
+    checked_relations = []
+    for condition in relation_triggers:
+        if not isinstance(condition, dict) or set(condition) != {'fact_id', 'equals'}:
+            raise StoryError('INVALID_REQUEST', '关系触发需要事实 ID 和明确匹配值。')
+        fid = resolve_fact_id(conn, book_id, condition['fact_id'], branch_id=branch_id)
+        expected = canonical_value(conn, book_id, condition['equals'], branch_id)
+        checked_relations.append({'fact_id': fid, 'equals': expected})
+    if data is not None and (not isinstance(data, dict) or '_schedule' in data):
+        raise StoryError('INVALID_REQUEST', '伏笔资料无效或使用了保留字段。')
+    saved_data = dict(data or {})
+    if due_from_chapter is not None or checked_relations:
+        saved_data['_schedule'] = {'from': due_from_chapter, 'to': due_to_chapter, 'relations': checked_relations}
     if owner_entity_id:
         owner_entity_id = resolve_entity_id(conn, book_id, owner_entity_id, branch_id=branch_id)
     if source_version is not None or source_chapter is not None:
@@ -304,7 +334,7 @@ def schedule_promise(conn, book_id, label, *, due_chapter=None, triggers=(), man
     conn.execute('INSERT INTO lm_promises VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                  (promise_id, book_id, branch_id, _text(label, 'label'), status, due_chapter,
                   dumps(trigger_list), int(mandatory), visibility, owner_entity_id or '',
-                  source_chapter, source_version, dumps(data or {})))
+                  source_chapter, source_version, dumps(saved_data)))
     return promise_id
 
 
@@ -341,7 +371,7 @@ def set_promise_status(conn, book_id, promise_id, status, *, branch_id='main',
 
 
 def select_promises(conn, book_id, chapter_number, *, trigger_keys=(), explicit_ids=(),
-                    role='author', pov_entity_id=None, branch_id='main'):
+                    role='author', pov_entity_id=None, branch_id='main', story_time=None):
     _book(conn, book_id, branch_id)
     _chapter_number(chapter_number, 'chapter_number')
     if role not in {'reader', 'author'}:
@@ -371,12 +401,30 @@ def select_promises(conn, book_id, chapter_number, *, trigger_keys=(), explicit_
         if item['status'] in ('resolved', 'cancelled') and item['id'] not in explicit:
             continue
         due = item['due_chapter']
+        schedule = json.loads(item['data']).get('_schedule', {})
+        start, end = schedule.get('from'), schedule.get('to')
+        relation_matches = []
+        if story_time is not None and schedule.get('relations'):
+            for condition in schedule['relations']:
+                fid = resolve_fact_id(conn, book_id, condition['fact_id'], branch_id=branch_id)
+                state = current_state(conn, book_id, [], fact_ids=[fid], through_chapter=chapter_number-1,
+                    story_time=story_time, role=role, pov_entity_id=pov_entity_id, branch_id=branch_id)
+                expected = canonical_value(conn, book_id, condition['equals'], branch_id)
+                for current in state:
+                    if json.dumps(current['value'], sort_keys=True) == json.dumps(expected, sort_keys=True):
+                        relation_matches.append(current['event_id'])
         reason = ('explicit_reference' if item['id'] in explicit else
+                  'window_open' if start is not None and start <= chapter_number <= end else
+                  'overdue' if end is not None and chapter_number > end else
                   'due' if item['status'] == 'due' or (due is not None and due <= chapter_number) else
+                  'relation_triggered' if relation_matches else
                   'triggered' if triggers.intersection(json.loads(item['triggers'])) else None)
         if reason:
             item['promise_id'] = item.pop('id')
             item['context_reason'] = reason
+            item['urgency'] = reason
+            if relation_matches:
+                item['trigger_event_ids'] = relation_matches
             item['status'] = 'due' if reason == 'due' else item['status']
             item['data'] = json.loads(item['data'])
             item['triggers'] = json.loads(item['triggers'])

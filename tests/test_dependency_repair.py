@@ -1,5 +1,17 @@
 """Synthetic author repair packages, without models or external resources."""
 import pytest
+
+
+def test_invalidation_does_not_open_empty_unrepairable_case(tmp_path):
+    from story_core.storage import Store
+    from test_long_memory import chapter
+    from story_core.long_memory import invalidate_version
+    store = Store(tmp_path)
+    book = store.create_book('test', 'test', {})['book_id']
+    with store.write(book) as conn:
+        version = chapter(conn, book, 1)
+        invalidate_version(conn, book, version)
+        assert conn.execute("SELECT count(*) FROM lm_repair_cases WHERE status='open'").fetchone()[0] == 0
 from story_core import long_memory as lm
 from story_core.storage import Store, uid
 from story_core.errors import StoryError

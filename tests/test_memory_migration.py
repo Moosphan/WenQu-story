@@ -1,14 +1,16 @@
 """Upgrade a database containing only the pre-normalization tables."""
 import sqlite3
+import pytest
 
 from story_core.storage import SCHEMA, Store
 
 
-def test_upgrade_from_real_legacy_table_set_keeps_manuscript_and_memory(tmp_path):
+@pytest.mark.parametrize('old_version', [7, 8, 9])
+def test_upgrade_from_real_legacy_table_set_keeps_manuscript_and_memory(tmp_path, old_version):
     path = tmp_path / 'project.sqlite'
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
-        conn.execute('PRAGMA user_version=7')
+        conn.execute(f'PRAGMA user_version={old_version}')
         conn.execute("INSERT INTO books(id,title,request,config,created_at) VALUES ('b','fixture','synthetic','{}',0)")
         conn.execute("INSERT INTO chapter_versions VALUES ('v','b',1,'fixture','铜牌还未归还。',0)")
         conn.execute("INSERT INTO chapters VALUES ('b',1,'v','committed')")
@@ -18,7 +20,7 @@ def test_upgrade_from_real_legacy_table_set_keeps_manuscript_and_memory(tmp_path
     for _ in range(2):
         store = Store(tmp_path)
         with store.read() as conn:
-            assert conn.execute('PRAGMA user_version').fetchone()[0] == 9
+            assert conn.execute('PRAGMA user_version').fetchone()[0] == 10
             assert conn.execute('SELECT body FROM chapter_versions').fetchone()[0] == '铜牌还未归还。'
             assert conn.execute('SELECT id FROM memories').fetchone()[0] == 'm'
             assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='lm_promise_status_events'").fetchone()

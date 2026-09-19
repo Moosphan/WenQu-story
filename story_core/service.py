@@ -169,6 +169,19 @@ def _run(row):
     return result
 
 
+def _initial_retrieval_query(book, run):
+    if run['stage'] == 'reader':
+        return (run.get('candidate') or {}).get('body', '')[:1000]
+    plan = next((item for item in (book.get('plan') or {}).get('chapters', [])
+                 if item['number'] == run['chapter_number']), {})
+    return ' '.join([*(str(plan.get(key) or '') for key in ('goal', 'conflict', 'change', 'pov')),
+                     *plan.get('participants', [])])[:1000]
+
+
+def _retrieval_snapshot(book, run):
+    return (book['revision'], run['run_id'], run['stage'], run['chapter_number'], dumps(run.get('candidate')))
+
+
 def _task(row):
     result = dict(row)
     result['task_id'] = result.pop('id')
@@ -179,7 +192,13 @@ def _task(row):
     return result
 
 
-class StoryService(ContextActions, MemoryActions):
+from .memory_summaries import SummaryActions
+from .book_branches import BranchActions
+from .memory_repair import RepairActions
+from .memory_promises import PromiseActions
+
+
+class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions, RepairActions, PromiseActions):
     def __init__(self, root):
         self.store = Store(root)
 
@@ -509,12 +528,15 @@ class StoryService(ContextActions, MemoryActions):
             return {'book_id': book_id, 'restored': True}
 
     def purge_book(self, book_id):
+        from .semantic_retrieval import delete_semantic_book, purge_semantic_files
         with self.store.write(book_id, allow_trash=True) as conn:
             if not conn.execute('SELECT 1 FROM book_trash WHERE book_id=?', (book_id,)).fetchone():
                 raise StoryError('DELETE_FORBIDDEN', '只能彻底删除回收站中的作品。')
+            delete_semantic_book(conn, book_id)
             for table in ('workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports', 'book_trash'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
+        purge_semantic_files(self.store, book_id)
         for category in ('tts-cache', 'exports'):
             parent = (self.store.root / category).resolve()
             folder = parent / book_id
@@ -535,16 +557,19 @@ class StoryService(ContextActions, MemoryActions):
             return self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
 
     def delete_sample(self, book_id):
+        from .semantic_retrieval import delete_semantic_book, purge_semantic_files
         with self.store.write(book_id) as conn:
             row = conn.execute('SELECT kind FROM books WHERE id=?', (book_id,)).fetchone()
             if row['kind'] != 'sample':
                 raise StoryError('DELETE_FORBIDDEN', '只能删除标记为测试样例的作品。')
             if conn.execute("SELECT 1 FROM runs WHERE book_id=? AND status IN ('running','paused','needs_attention','awaiting_author')", (book_id,)).fetchone():
                 raise StoryError('RUN_ACTIVE', '请先结束该样例的进行中任务。')
+            delete_semantic_book(conn, book_id)
             for table in ('workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
-            return {'book_id': book_id, 'deleted': True}
+        purge_semantic_files(self.store, book_id)
+        return {'book_id': book_id, 'deleted': True}
 
     def get_book(self, book_id):
         with self.store.read() as conn:
@@ -645,12 +670,16 @@ class StoryService(ContextActions, MemoryActions):
                 raise StoryError('ARCHIVED_PROJECT', '已归档作品请先恢复到“我的作品”或“测试样例”，再继续写作。')
             return self._insert_run(conn,book,chapter_limit,max_steps,max_revisions,budget_tokens,review_mode=review_mode)
 
-    def _input(self, conn, book, run):
+    def _input(self, conn, book, run, policy=None, retrieval_query=None):
         stage, number = run['stage'], run['chapter_number']
         candidate = run['candidate']
         common = {'instruction': instruction(stage), 'chapter_number': number}
-        prior = [dict(r) for r in conn.execute('''SELECT c.number chapter_number,c.version_id,v.title,v.body FROM chapters c JOIN chapter_versions v ON v.id=c.version_id
-            WHERE c.book_id=? AND c.number<? AND c.status='committed' ORDER BY c.number''', (book['book_id'], number))]
+        adaptive = policy is not None and policy.mode == 'adaptive'
+        prior_query = '''SELECT c.number chapter_number,c.version_id,v.title,v.body FROM chapters c JOIN chapter_versions v ON v.id=c.version_id
+            WHERE c.book_id=? AND c.number<? AND c.status='committed' ORDER BY c.number'''
+        prior = [dict(r) for r in conn.execute(prior_query + (' DESC LIMIT 3' if adaptive else ''), (book['book_id'], number))]
+        if adaptive:
+            prior.reverse()
         # Reader never gets plans, hidden facts, author reviews or future chunks.
         if stage == 'reader':
             completed = {review.get('reader_profile') for review in run['reviews'] or [] if review.get('stage') == 'reader'}
@@ -659,7 +688,13 @@ class StoryService(ContextActions, MemoryActions):
                 raise StoryError('INVALID_STATE', '当前候选稿的读者审稿已完成。')
             profile = reader_profile(profile_id)
             history = [{'chapter_number': c['chapter_number'], 'title': c['title'], 'body': c['body']} for c in prior[-3:]]
-            public = [m for m in canonical_memory(conn,book['book_id'],number-1) if m.get('visibility','reader')=='reader' and m['kind'] in ('summary','emotion','relationship')]
+            if adaptive:
+                from .retrieval import retriever_for, RetrievalScope
+                retrieved = retriever_for(self.store).search(retrieval_query if retrieval_query is not None else _initial_retrieval_query(book, run),
+                    RetrievalScope(book['book_id'], number-1, role='reader'), conn=conn, limit=12)
+                public = retrieved['hits']
+            else:
+                public = [m for m in canonical_memory(conn,book['book_id'],number-1) if m.get('visibility','reader')=='reader' and m['kind'] in ('summary','emotion','relationship')]
             return {**common, 'instruction': instruction('reader', profile_id), 'reader_profile': profile,
                     'candidate':candidate,'reader_history':history,'reader_memory':public,
                     'read_boundary':number,
@@ -700,7 +735,21 @@ class StoryService(ContextActions, MemoryActions):
         data['arc_window'] = [c for c in book['plan']['chapters'] if abs(c['number']-number)<=2]
         data['planned_promises'] = book['plan']['promises']
         memory_boundary = number if stage in ('ending', 'arc') else number - 1
-        memories = canonical_memory(conn,book['book_id'],memory_boundary)
+        if adaptive:
+            from .memory import selected_canonical_memory
+            memories = selected_canonical_memory(conn, book['book_id'], memory_boundary, kinds=['promise'])
+            from .retrieval import retriever_for, RetrievalScope
+            plan = data['chapter_plan'] or {}
+            if stage != 'extract':
+                query = retrieval_query if retrieval_query is not None else _initial_retrieval_query(book, run)
+                retrieved = retriever_for(self.store).search(query,
+                    RetrievalScope(book['book_id'], memory_boundary, pov=plan.get('pov')), conn=conn, limit=12)
+                data['historical_evidence'] = retrieved['hits']
+            if stage == 'extract':
+                memories += selected_canonical_memory(conn, book['book_id'], memory_boundary,
+                    kinds=['entity', 'fact', 'relationship', 'knowledge'], limit=64)
+        else:
+            memories = canonical_memory(conn,book['book_id'],memory_boundary)
         data['promise_obligations'] = promise_obligations(memories, book['plan'], number)
         data['context_selection'] = {'settled_promise_ids': [m['key'] for m in memories if m.get('kind') == 'promise' and m.get('status') in ('paid', 'waived')]}
         layers = context_layers(memories, data['chapter_plan'] or {}, number)
@@ -711,7 +760,7 @@ class StoryService(ContextActions, MemoryActions):
         data['pov_context'] = layers['pov_guard']
         data['recent_chapters'] = prior[-2:]
         data['context_manifest'] = _context_manifest(book, 'author', memory_boundary,
-                                                      [*layers['required'], *layers['supplementary']], prior[-2:],
+                                                      [*layers['required'], *layers['supplementary'], *data.get('historical_evidence', [])], prior[-2:],
                                                       layers['required'], layers['supplementary'], layers['pov_guard'])
         if candidate:
             data['candidate'] = candidate
@@ -835,14 +884,14 @@ class StoryService(ContextActions, MemoryActions):
         conn.execute("UPDATE books SET status='needs_attention' WHERE id=?",(run['book_id'],))
         self.store.event(conn,run['book_id'],'needs_attention',{'reason':reason},run['run_id'])
 
-    def _task_spec(self, conn, book, run):
-        data=self._input(conn,book,run)
+    def _task_spec(self, conn, book, run, policy=None, retrieval_query=None):
+        policy = policy or ContextPolicy.from_env(run['stage'], self.store.root / 'context-policy.json')
+        data=self._input(conn,book,run,policy,retrieval_query)
         schema = adjudication_schema(data['review_adjudication']) if data.get('review_adjudication') else REPAIR_SCHEMA if data.get('extraction_repair') else review_source_schema(run['candidate']) if run['stage'] == 'continuity' else SCHEMAS[run['stage']]
         if data.get('revision_mode') in ('expand_full_body', 'full_body'):
             schema = SCHEMAS['revise']['oneOf'][0]
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
         reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
-        policy = ContextPolicy.from_env(run['stage'], self.store.root / 'context-policy.json')
         policy = replace(policy, output_reserve=max(MAX_TASK_OUTPUT_TOKENS, policy.output_reserve))
         if policy.mode == 'adaptive' and run['stage'] not in ('brief', 'outline'):
             from .long_memory import current_state, resolve_alias, select_promises
@@ -854,9 +903,21 @@ class StoryService(ContextActions, MemoryActions):
             if plan.get('entity_ids') and 'story_time' in plan:
                 data['current_state'] = current_state(conn, book['book_id'], plan['entity_ids'],
                     through_chapter=run['chapter_number']-1, story_time=plan['story_time'], role=role, pov_entity_id=pov_id)
+                if run['stage'] != 'extract':
+                    from .memory_relations import related_evidence
+                    related = related_evidence(conn, book['book_id'], plan['entity_ids'],
+                        through_chapter=run['chapter_number']-1, story_time=plan['story_time'], role=role, pov_entity_id=pov_id)
+                    data.setdefault('historical_evidence', []).extend(related)
             scheduled = select_promises(conn, book['book_id'], run['chapter_number'],
-                explicit_ids=plan.get('promise_ids', []), trigger_keys=plan.get('trigger_keys', []), role=role, pov_entity_id=pov_id)
+                explicit_ids=plan.get('promise_ids', []), trigger_keys=plan.get('trigger_keys', []), role=role, pov_entity_id=pov_id,
+                story_time=plan.get('story_time'))
             data['scheduled_promises'] = scheduled['required']
+            if run['stage'] != 'extract':
+                from .memory_summaries import select_summaries
+                # An unresolved POV cannot inherit unrestricted author summaries.
+                data['semantic_summaries'] = select_summaries(conn, book['book_id'],
+                    through_chapter=run['chapter_number'] if run['stage'] in ('arc', 'ending') else run['chapter_number']-1,
+                    role=role, pov_entity_id=(pov_id or 'unresolved-pov') if pov else None)
             # Reader/extraction views intentionally lack author chapter_plan.
             # Keep only dependency IDs, never its future plot text.
             data['context_required_ids'] = [*plan.get('required_fact_ids', []), *plan.get('promise_ids', [])]
@@ -879,6 +940,20 @@ class StoryService(ContextActions, MemoryActions):
     def next_task(self, book_id, worker_id='host'):
         if not isinstance(worker_id,str) or not worker_id or len(worker_id)>100:
             raise StoryError('INVALID_REQUEST','worker_id 无效。')
+        prepared, selected_policy = None, None
+        with self.store.read() as read_conn:
+            snapshot_row = read_conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone()
+            if snapshot_row is None:
+                raise StoryError('NOT_FOUND', '找不到这本书。')
+            snapshot_book = self.store.decode_book(snapshot_row)
+            snapshot_run = self._latest_run(read_conn, book_id)
+            active_lease = read_conn.execute("SELECT 1 FROM tasks WHERE book_id=? AND status='leased' AND lease_until>? LIMIT 1",
+                                            (book_id, time.time())).fetchone()
+        if snapshot_run and snapshot_run['status'] == 'running' and not active_lease:
+            selected_policy = ContextPolicy.from_env(snapshot_run['stage'], self.store.root / 'context-policy.json')
+            if selected_policy.mode == 'adaptive' and snapshot_run['stage'] not in ('brief', 'outline', 'extract'):
+                from .retrieval import retriever_for
+                prepared = retriever_for(self.store).prepare_query(_initial_retrieval_query(snapshot_book, snapshot_run))
         with self.store.write(book_id) as conn:
             run = self._latest_run(conn,book_id)
             session = conn.execute('SELECT status,run_id FROM workbench_executions WHERE id=?', (worker_id,)).fetchone()
@@ -895,18 +970,21 @@ class StoryService(ContextActions, MemoryActions):
                 if task['worker_id']==worker_id:
                     return _task(task)
                 return {'task_id':None,'status':'leased','lease_until':task['lease_until']}
-            data, schema, reservation = self._task_spec(conn, book, run)
+            if (active_lease or snapshot_run is None
+                    or _retrieval_snapshot(book, run) != _retrieval_snapshot(snapshot_book, snapshot_run)):
+                raise StoryError('STALE_REVISION', '检索准备期间作品或任务已变化，请重新领取。')
+            data, schema, reservation = self._task_spec(conn, book, run, selected_policy, prepared)
             if not data['context_diagnostics']['executable']:
                 self._attention(conn,run,'本阶段上下文容量不足，请检查上下文诊断。')
-                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics']},run['run_id'])
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'], 'stage':run['stage'], 'chapter_number':run['chapter_number']},run['run_id'])
                 return {'task_id':None,'status':'needs_attention','reason':'context_capacity'}
             if run['steps']>=run['max_steps'] or run['tokens']+reservation>run['budget_tokens']:
                 self._attention(conn,run,'步骤或 token 预留预算不足；可提高预算后继续。')
-                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'financial_budget'},run['run_id'])
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'financial_budget', 'reservation':reservation, 'stage':run['stage'], 'chapter_number':run['chapter_number']},run['run_id'])
                 return {'task_id':None,'status':'needs_attention','reason':'budget'}
             if len(dumps(model_input(data)).encode())>180000:
                 self._attention(conn,run,'上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。')
-                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'transport_bytes'},run['run_id'])
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'transport_bytes', 'input_bytes':len(dumps(model_input(data)).encode()), 'stage':run['stage'], 'chapter_number':run['chapter_number']},run['run_id'])
                 return {'task_id':None,'status':'needs_attention','reason':'context_limit'}
             if task:
                 conn.execute("UPDATE tasks SET status='expired' WHERE id=?",(task['id'],))
@@ -1210,10 +1288,10 @@ class StoryService(ContextActions, MemoryActions):
                 # Scoped task queries use the same source/POV filter as lookup.
                 strategy = 'bounded'
         if strategy == 'bounded':
-            from .retrieval import RetrievalScope, SQLiteRetriever
+            from .retrieval import RetrievalScope, retriever_for
             if role == 'reader' and through_chapter is None:
                 raise StoryError('INVALID_SCOPE', '读者检索必须指定已读章节。')
-            result = SQLiteRetriever(self.store).search(query, RetrievalScope(book_id,
+            result = retriever_for(self.store).search(query, RetrievalScope(book_id,
                 through_chapter=through_chapter if through_chapter is not None else 2**31,
                 role=role, pov=pov), limit=limit)
             result['hits'] = [{**hit, 'text': f"{hit['key']}：{hit['value']}",
@@ -1297,20 +1375,44 @@ class StoryService(ContextActions, MemoryActions):
                            'failure_details':failure_details,
                            'started_at':task['created_at'],'elapsed_seconds':max(0, int((related['created_at'] if related else now)-task['created_at']))}
             blocker = None
-            if run and run['status'] == 'needs_attention' and run.get('reason') == '步骤或 token 预留预算不足；可提高预算后继续。':
-                _, _, reservation = self._task_spec(conn, book, run)
-                blocker = {'code': 'BUDGET_LIMIT', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
-                           'reserved_tokens': run['tokens'], 'budget_tokens': run['budget_tokens'],
-                           'next_reservation': reservation, 'minimum_budget_tokens': run['tokens'] + reservation,
-                           'steps': run['steps'], 'max_steps': run['max_steps'], 'minimum_max_steps': run['steps'] + 1}
-            if run and run['status'] == 'needs_attention' and run.get('reason') == '上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。':
-                context, _, _ = self._task_spec(conn, book, run)
-                blocker = {'code': 'CONTEXT_LIMIT', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
-                           'input_bytes': len(dumps(model_input(context)).encode()), 'limit_bytes': 180000}
-            if run and run['status'] == 'needs_attention' and run.get('reason') == '本阶段上下文容量不足，请检查上下文诊断。':
-                context, _, _ = self._task_spec(conn, book, run)
-                blocker = {'code': 'CONTEXT_CAPACITY', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
-                           'context': context['context_diagnostics']}
+            reasons = {
+                '步骤或 token 预留预算不足；可提高预算后继续。': 'BUDGET_LIMIT',
+                '上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。': 'CONTEXT_LIMIT',
+                '本阶段上下文容量不足，请检查上下文诊断。': 'CONTEXT_CAPACITY',
+            }
+            if run and run['status'] == 'needs_attention' and run.get('reason') in reasons:
+                code = reasons[run['reason']]
+                saved = conn.execute("SELECT payload FROM events WHERE run_id=? AND kind='context_blocked' ORDER BY seq DESC LIMIT 1",
+                                     (run['run_id'],)).fetchone()
+                measurement = json.loads(saved[0]) if saved else {}
+                if (measurement.get('stage') != run['stage']
+                        or measurement.get('chapter_number') != run['chapter_number']):
+                    measurement = {}
+                required = {'BUDGET_LIMIT': 'reservation', 'CONTEXT_LIMIT': 'input_bytes', 'CONTEXT_CAPACITY': 'context'}[code]
+                # Older runs lack persisted measurements. Lexical compilation remains
+                # local; never load an embedding model from a status read.
+                if required not in measurement:
+                    from .semantic_retrieval import load_policy
+                    try:
+                        lexical = load_policy(self.store)['strategy'] == 'lexical'
+                    except StoryError:
+                        lexical = False
+                    if lexical:
+                        context, _, reservation = self._task_spec(conn, book, run)
+                        measurement = {'reservation': reservation, 'input_bytes': len(dumps(model_input(context)).encode()),
+                                       'context': context['context_diagnostics']}
+                blocker = {'code': code, 'chapter_number': run['chapter_number'], 'stage': run['stage']}
+                if required not in measurement:
+                    blocker['measurement_unavailable'] = True
+                    blocker['message'] = '旧任务未保存阻塞测量；恢复后重新领取任务可更新诊断。'
+                elif code == 'BUDGET_LIMIT':
+                    blocker.update(reserved_tokens=run['tokens'], budget_tokens=run['budget_tokens'],
+                        next_reservation=measurement['reservation'], minimum_budget_tokens=run['tokens'] + measurement['reservation'],
+                        steps=run['steps'], max_steps=run['max_steps'], minimum_max_steps=run['steps'] + 1)
+                elif code == 'CONTEXT_LIMIT':
+                    blocker.update(input_bytes=measurement['input_bytes'], limit_bytes=180000)
+                else:
+                    blocker['context'] = measurement['context']
             token_usage = self._token_usage(conn, book_id)
             return {'book_id':book_id,'title':book['title'],'status':book['status'],'revision':book['revision'],
                     'chapters':counts,'target_chapters':book['settings']['chapter_count'],'run':run,'events':events,

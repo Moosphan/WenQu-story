@@ -108,9 +108,71 @@ class MemoryBindRequest(StrictModel):
     actor: str = 'author'
 
 
+class MemoryMergePreviewRequest(StrictModel):
+    source_id: str
+    target_id: str
+
+
+class MemoryMergeRequest(MemoryMergePreviewRequest):
+    conflict_resolutions: dict[str, str]
+    expected_revision: int = Field(ge=0)
+    request_id: str = Field(min_length=1, max_length=200)
+    actor: str = 'author'
+
+
 class MemoryMaintainRequest(StrictModel):
     limit: int = Field(default=5, ge=1, le=20)
     backfill: bool = False
+
+
+class SummaryProposalRequest(StrictModel):
+    level: str
+    chapter_start: int
+    chapter_end: int
+    text: str
+    source_refs: list[dict]
+    visibility: str = 'author'
+    owner_entity_id: str | None = None
+    request_id: str
+    origin: str = 'author'
+
+
+class SummaryDecisionRequest(StrictModel):
+    decision: str
+    actor: str = 'author'
+    expected_revision: int
+    request_id: str
+    trust: bool = False
+
+
+class BookForkRequest(StrictModel):
+    name: str
+    actor: str = 'author'
+    expected_revision: int
+    request_id: str
+
+
+class MemoryRepairRequest(StrictModel):
+    replacements: list[dict]
+    retire_event_ids: list[str]
+    dependency_versions: list[str]
+    actor: str = 'author'
+    expected_revision: int
+    request_id: str
+    trust: bool = False
+
+
+class MemoryPromiseRequest(StrictModel):
+    label: str
+    actor: str = 'author'
+    expected_revision: int
+    request_id: str
+    options: dict = Field(default_factory=dict)
+
+
+class RetrievalConfigRequest(StrictModel):
+    strategy: str = 'lexical'
+    model_path: str | None = None
 
 
 class BookKindRequest(StrictModel):
@@ -428,6 +490,60 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
     def query(book_id: str, body: QueryRequest):
         return service.query(book_id,**body.model_dump())
 
+    @app.post('/api/books/{book_id}/memory/promises')
+    def memory_schedule_promise(book_id: str, body: MemoryPromiseRequest):
+        if set(body.options) & {'book_id', 'label', 'actor', 'expected_revision', 'request_id'}:
+            raise StoryError('INVALID_REQUEST', '伏笔选项不能覆盖请求身份或版本字段。')
+        return service.memory_schedule_promise(book_id, body.label, actor=body.actor,
+            expected_revision=body.expected_revision, request_id=body.request_id, **body.options)
+
+    @app.get('/api/books/{book_id}/memory/promises')
+    def memory_promises(book_id: str, chapter_number: int, story_time: float | None = None):
+        return service.memory_promises(book_id, chapter_number, story_time=story_time)
+
+    @app.get('/api/retrieval/config')
+    def retrieval_config():
+        from .semantic_retrieval import load_policy
+        return load_policy(service.store)
+
+    @app.put('/api/retrieval/config')
+    def configure_retrieval(body: RetrievalConfigRequest):
+        from .semantic_retrieval import configure_retrieval
+        return configure_retrieval(service.store, body.model_dump(exclude_none=True))
+
+    @app.post('/api/books/{book_id}/memory/semantic-index')
+    def maintain_semantic_index(book_id: str):
+        from .semantic_retrieval import maintain_semantic_index
+        return maintain_semantic_index(service.store, book_id)
+
+    @app.get('/api/books/{book_id}/memory/repairs/{source_version}')
+    def memory_repair_preview(book_id: str, source_version: str):
+        return service.memory_repair_preview(book_id, source_version)
+
+    @app.post('/api/books/{book_id}/memory/repairs/{source_version}')
+    def memory_repair(book_id: str, source_version: str, body: MemoryRepairRequest):
+        return service.memory_repair(book_id, source_version, **body.model_dump())
+
+    @app.get('/api/books/{book_id}/branches')
+    def book_branches(book_id: str):
+        return service.book_branches(book_id)
+
+    @app.post('/api/books/{book_id}/branches')
+    def fork_book(book_id: str, body: BookForkRequest):
+        return service.fork_book(book_id, **body.model_dump())
+
+    @app.get('/api/books/{book_id}/memory/summaries')
+    def memory_summaries(book_id: str, status: str | None = None, limit: int = 50, offset: int = 0):
+        return service.memory_summaries(book_id, status=status, limit=limit, offset=offset)
+
+    @app.post('/api/books/{book_id}/memory/summaries')
+    def memory_summary_propose(book_id: str, body: SummaryProposalRequest):
+        return service.memory_summary_propose(book_id, **body.model_dump())
+
+    @app.post('/api/books/{book_id}/memory/summaries/{summary_id}/decision')
+    def memory_summary_decide(book_id: str, summary_id: str, body: SummaryDecisionRequest):
+        return service.memory_summary_decide(book_id, summary_id, **body.model_dump())
+
     @app.get('/api/books/{book_id}/memory/entities')
     def memory_entities(book_id: str, limit: int = 100, offset: int = 0):
         return service.memory_entities(book_id, limit, offset)
@@ -451,6 +567,14 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
     @app.post('/api/books/{book_id}/memory/proposals/{proposal_id}/bind')
     def memory_bind(book_id: str, proposal_id: str, body: MemoryBindRequest):
         return service.memory_bind(book_id, proposal_id, **body.model_dump())
+
+    @app.post('/api/books/{book_id}/memory/merge/preview')
+    def memory_merge_preview(book_id: str, body: MemoryMergePreviewRequest):
+        return service.memory_merge_preview(book_id, **body.model_dump())
+
+    @app.post('/api/books/{book_id}/memory/merge')
+    def memory_merge(book_id: str, body: MemoryMergeRequest):
+        return service.memory_merge(book_id, **body.model_dump())
 
     @app.get('/api/books/{book_id}/memory/maintenance')
     def memory_maintenance(book_id: str, limit: int = 50, offset: int = 0):

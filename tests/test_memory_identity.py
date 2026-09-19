@@ -4,6 +4,42 @@ from story_core import long_memory as lm
 from story_core.errors import StoryError
 
 
+def test_merge_does_not_offer_stale_events_as_conflict_winners(world):
+    from story_core.memory_identity import preview_entity_merge, merge_entities
+    store, book = world
+    with store.write() as conn:
+        a, b = [lm.register_entity(conn, book, name) for name in ('a', 'b')]
+        stale = chapter(conn, book, 1)
+        fact(conn, book, a, stale, 1, value=10)
+        current = chapter(conn, book, 1)
+        fact(conn, book, b, current, 1, value=3)
+        assert preview_entity_merge(conn, book, a, b)['conflicts'] == []
+        merge_entities(conn, book, a, b, conflict_resolutions={}, actor='author', expected_revision=0, request_id='m')
+        assert lm.current_state(conn, book, [b], story_time=1)[0]['value'] == 3
+
+
+def test_merge_compares_relationship_values_after_proposed_identity_mapping(world):
+    from story_core.memory_identity import preview_entity_merge
+    store, book = world
+    with store.write() as conn:
+        a, b = [lm.register_entity(conn, book, name) for name in ('a', 'b')]
+        version = chapter(conn, book, 1)
+        for entity in (a, b):
+            fact(conn, book, entity, version, 1, predicate='owner', value={'type': 'entity', 'entity_id': entity})
+        assert preview_entity_merge(conn, book, a, b)['conflicts'] == []
+
+
+def test_merge_keeps_boolean_and_number_values_distinct(world):
+    from story_core.memory_identity import preview_entity_merge
+    store, book = world
+    with store.write() as conn:
+        a, b = [lm.register_entity(conn, book, name) for name in ('a', 'b')]
+        version = chapter(conn, book, 1)
+        fact(conn, book, a, version, 1, value={'value': True})
+        fact(conn, book, b, version, 1, value={'value': 1})
+        assert len(preview_entity_merge(conn, book, a, b)['conflicts']) == 1
+
+
 def test_merge_preserves_history_and_resolves_old_ids(world):
     from story_core.memory_identity import merge_entities, resolve_fact_id, resolve_entity_id, preview_entity_merge
     store, book = world

@@ -41,7 +41,27 @@ def _parser() -> argparse.ArgumentParser:
     entity = operations.add_parser('entity'); entity.add_argument('name'); entity.add_argument('--actor', required=True)
     maintenance = operations.add_parser('maintain'); maintenance.add_argument('--limit', type=int, default=5); maintenance.add_argument('--backfill', action='store_true')
     operations.add_parser('maintenance')
+    operations.add_parser('summaries')
+    promise = operations.add_parser('promise-schedule'); promise.add_argument('--file', type=Path, required=True)
+    promises = operations.add_parser('promises'); promises.add_argument('--chapter', type=int, required=True); promises.add_argument('--story-time', type=float)
+    semantic_index = operations.add_parser('semantic-index'); semantic_index.add_argument('--batch-size', type=int, default=32)
+    repair_preview = operations.add_parser('repair-preview'); repair_preview.add_argument('source_version')
+    repair = operations.add_parser('repair'); repair.add_argument('source_version'); repair.add_argument('--file', type=Path, required=True)
+    summary = operations.add_parser('summary-propose'); summary.add_argument('--file', type=Path, required=True)
+    summary_decide = operations.add_parser('summary-decide'); summary_decide.add_argument('summary_id')
+    summary_decide.add_argument('--decision', choices=('accept', 'reject'), required=True)
+    summary_decide.add_argument('--actor', required=True); summary_decide.add_argument('--expected-revision', type=int, required=True)
+    summary_decide.add_argument('--request-id', required=True); summary_decide.add_argument('--verified-by-author', action='store_true')
+    preview = operations.add_parser('merge-preview'); preview.add_argument('source_id'); preview.add_argument('target_id')
+    merge = operations.add_parser('merge'); merge.add_argument('source_id'); merge.add_argument('target_id')
+    merge.add_argument('--resolutions-file', type=Path, required=True); merge.add_argument('--actor', required=True)
+    merge.add_argument('--expected-revision', type=int, required=True); merge.add_argument('--request-id', required=True)
     status = commands.add_parser("status"); status.add_argument("book")
+    branches = commands.add_parser('branches'); branches.add_argument('book')
+    retrieval_config = commands.add_parser('retrieval-config'); retrieval_config.add_argument('--file', type=Path)
+    fork = commands.add_parser('fork'); fork.add_argument('book'); fork.add_argument('--name', required=True)
+    fork.add_argument('--actor', required=True); fork.add_argument('--expected-revision', type=int, required=True)
+    fork.add_argument('--request-id', required=True)
     project = commands.add_parser('project'); project.add_argument('book'); project.add_argument('--metadata-file', type=Path); project.add_argument('--expected-revision', type=int)
     report = commands.add_parser('report'); report.add_argument('book')
     for name in ("pause", "resume", "cancel"):
@@ -79,8 +99,30 @@ def _dispatch(args: argparse.Namespace) -> Any:
 
     service = StoryService(args.root)
     command = args.command
+    if command == 'retrieval-config':
+        from .semantic_retrieval import configure_retrieval, load_policy
+        return configure_retrieval(service.store, json.loads(args.file.read_text(encoding='utf-8'))) if args.file else load_policy(service.store)
+    if command == 'branches': return service.book_branches(args.book)
+    if command == 'fork': return service.fork_book(args.book, name=args.name, actor=args.actor,
+        expected_revision=args.expected_revision, request_id=args.request_id)
     if command == 'memory':
         operation = args.memory_action
+        if operation == 'promise-schedule': return service.memory_schedule_promise(args.book, **json.loads(args.file.read_text(encoding='utf-8')))
+        if operation == 'promises': return service.memory_promises(args.book, args.chapter, story_time=args.story_time)
+        if operation == 'semantic-index':
+            from .semantic_retrieval import maintain_semantic_index
+            return maintain_semantic_index(service.store, args.book, batch_size=args.batch_size)
+        if operation == 'repair-preview': return service.memory_repair_preview(args.book, args.source_version)
+        if operation == 'repair': return service.memory_repair(args.book, args.source_version, **json.loads(args.file.read_text(encoding='utf-8')))
+        if operation == 'summaries': return service.memory_summaries(args.book)
+        if operation == 'summary-propose': return service.memory_summary_propose(args.book, **json.loads(args.file.read_text(encoding='utf-8')))
+        if operation == 'summary-decide': return service.memory_summary_decide(args.book, args.summary_id,
+            decision=args.decision, actor=args.actor, expected_revision=args.expected_revision,
+            request_id=args.request_id, trust=args.verified_by_author)
+        if operation == 'merge-preview': return service.memory_merge_preview(args.book, args.source_id, args.target_id)
+        if operation == 'merge': return service.memory_merge(args.book, args.source_id, args.target_id,
+            conflict_resolutions=json.loads(args.resolutions_file.read_text(encoding='utf-8')), actor=args.actor,
+            expected_revision=args.expected_revision, request_id=args.request_id)
         if operation == 'list': return service.memory_proposals(args.book, args.status, args.limit, args.offset)
         if operation == 'propose': return service.memory_propose(args.book, json.loads(args.file.read_text(encoding='utf-8')), request_id=args.request_id)
         if operation == 'decide': return service.memory_decide(args.book, args.proposal, decision=args.decision, actor=args.actor,

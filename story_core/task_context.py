@@ -3,7 +3,7 @@ import json
 import time
 
 from .errors import StoryError
-from .retrieval import MAX_LOOKUPS, RetrievalScope, SQLiteRetriever
+from .retrieval import MAX_LOOKUPS, RetrievalScope, retriever_for
 from .storage import dumps
 
 LOOKUP_STAGES = {'draft', 'revise', 'continuity', 'reader', 'arc', 'ending'}
@@ -42,6 +42,11 @@ class ContextActions:
         result = {'context_lookup': {'query': query, 'reason': reason}}
         if list(Draft202012Validator(LOOKUP_SCHEMA).iter_errors(result)) or not query.strip() or not reason.strip():
             raise StoryError('INVALID_LOOKUP', '补查需要 1–1000 字查询与 1–500 字说明。')
+        with self.store.read() as read_conn:
+            previous = read_conn.execute('SELECT status FROM tasks WHERE id=?', (task_id,)).fetchone()
+        is_replay = previous is not None and previous['status'] == 'lookup'
+        retriever = None if is_replay else retriever_for(self.store)
+        prepared_query = query if is_replay else retriever.prepare_query(query)
         with self.store.write() as conn:
             task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             if not task:
@@ -69,7 +74,9 @@ class ContextActions:
             pov = (data.get('pov_context') or {}).get('pov')
             role = 'reader' if task['stage'] == 'reader' else 'author'
             scope = RetrievalScope(task['book_id'], through_chapter=task['chapter_number']-1, role=role, pov=pov)
-            retrieved = SQLiteRetriever(self.store).search(query, scope, limit=10)
+            if retriever is None:
+                raise StoryError('STALE_REVISION', '补查状态已变化，请重新读取任务。')
+            retrieved = retriever.search(prepared_query, scope, limit=10, conn=conn)
             response = {'accepted': True, 'task_id': task_id, 'status': 'context_refreshed', 'next_stage': task['stage'],
                         'lookup_number': used+1, 'hit_count': len(retrieved['hits']),
                         'index_complete': retrieved['index_complete'], 'evidence': retrieved['hits']}
