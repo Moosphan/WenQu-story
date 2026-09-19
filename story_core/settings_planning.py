@@ -38,12 +38,14 @@ def virtual_book(conn, book):
         raise StoryError('STALE_REVISION', '规划期间作品已变化，请取消当前规划后重新保存设置。')
     result = deepcopy(book)
     result.update(title=job['target']['title'], settings=job['target']['settings'])
+    if job['target'].get('brief'):
+        result['brief'] = deepcopy(job['target']['brief'])
     if result.get('brief'):
         result['brief']['title'] = result['title']
     return result
 
 
-def begin(service, conn, book, run, title, settings, *, adopt=False):
+def begin(service, conn, book, run, title, settings, *, adopt=False, proposed_brief=None, direction=None):
     require_idle(conn, book['book_id'])
     active = run and run['status'] in ('running', 'paused', 'needs_attention', 'awaiting_author')
     snapshot = {'run': {key: run[key] for key in ('stage', 'end_chapter', 'status')} if active else None,
@@ -59,7 +61,7 @@ def begin(service, conn, book, run, title, settings, *, adopt=False):
     conn.execute("UPDATE books SET revision=?,status='planning' WHERE id=?", (revision, book['book_id']))
     conn.execute("UPDATE runs SET status='running',stage='outline',reason=NULL WHERE id=?", (run['run_id'],))
     conn.execute("INSERT INTO settings_planning_jobs VALUES (?,?,?,'pending',?,?,?,?)",
-        (uid('planning'), book['book_id'], run['run_id'], dumps({'title': title, 'settings': settings}), dumps(snapshot), revision, time.time()))
+        (uid('planning'), book['book_id'], run['run_id'], dumps({'title': title, 'settings': settings, 'brief': proposed_brief, 'direction': direction}), dumps(snapshot), revision, time.time()))
     service.store.event(conn, book['book_id'], 'settings_planning_started', {'target_settings': settings, 'adopted': adopt}, run['run_id'])
     return {'book_id': book['book_id'], 'title': book['title'], 'settings': book['settings'], 'revision': revision,
             'replan': True, 'planning_pending': True, 'target_settings': settings, 'run_paused': False}

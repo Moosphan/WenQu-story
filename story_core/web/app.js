@@ -1,6 +1,7 @@
 const element = id => document.getElementById(id);
 const state = { book: null, chapter: null, task: null, api: false, executor: 'manual', worker: false, dirty: false, books: [], reviews: [], candidateVersions: [], facets: {}, memoryFacet: '全部', versions: [], status: null, selection: 0, polling: false, busy: new Set(), editRevision: null, marketSources: new Set(), marketSelectionInitialized: false, aiConfig: null, activeView: 'overview', reviewView: 'reviews', focused: false, tts: { request: 0, objectUrl: '', key: '', playing: false }, ttsVoices: [] };
 let memoryOffset = 0;
+let authorAssistant = null;
 const statuses = { planning: '设置规划中', awaiting_author: '等待作者确认', new: '新作品', imported: '导入待审', writing: '写作中', running: '进行中', paused: '已暂停', needs_attention: '需要处理', complete: '已完结', draft: '未完稿', batch_complete: '本轮完成', cancelled: '已结束' };
 const stages = { brief: '建立创作约定', outline: '规划全书', draft: '写作正文', extract: '提取故事记忆', continuity: '核对连续性', reader: '读者审稿', arc: '故事弧审校', revise: '修改候选稿', ending: '全书完结审查', human: '真人反馈' };
 const readerProfiles = { target_reader: '目标题材读者', logic_reader: '逻辑敏感读者' };
@@ -171,6 +172,7 @@ function renderSelectedChapter() {
   element('selected-action-hint').textContent = blocked && run?.status !== 'awaiting_author' ? `全书任务停留在第 ${run.chapter_number} 章；暂停可原位续写，结束本轮后可单独审核其他章节。` : '审核与修改作用于上方所选章节；作者确认只绑定此正文版本。';
 }
 function controls() {
+  if (typeof authorAssistant !== 'undefined') authorAssistant?.contextChanged();
   const run = state.status?.run; const active = run && ['running', 'paused', 'needs_attention'].includes(run.status); const archived = state.book?.book_kind === 'archived';
   const revisionUnlocked = !active || needsAuthorRevision(run);
   element('get-task').hidden = Boolean(state.worker);
@@ -1058,7 +1060,7 @@ async function refreshStatus() {
       const chapterNumber = state.chapter?.chapter_number; state.book = book; state.chapter = null; renderBook();
       const chapter = book.chapters.find(item => item.chapter_number === chapterNumber); if (chapter) selectChapter(chapter);
     }
-  } finally { state.polling = false; }
+  } finally { state.polling = false; if (typeof authorAssistant !== 'undefined') await authorAssistant?.refresh(); }
 }
 async function continueWriting() {
   if (state.status?.settings_planning) { notice('请先完成或取消作品设置规划，再继续章节写作。'); return; }
@@ -1308,6 +1310,10 @@ async function loadAIConfig() {
 function openAISettings() { loadAIConfig().then(() => openDialog('ai-config-dialog')).catch(error => notice(error.message)); }
 
 function bind() {
+  authorAssistant = window.WenQuAssistant.create({element, node, api,
+    getContext: () => ({book: state.book, chapter: state.chapter, view: state.activeView, dirty: state.dirty, status: state.status}),
+    onApplied: async () => { await refreshStatus(); notice('已按确认方案启动独立规划；已有正文保留，规划完成后再单独继续写作。'); }
+  });
   for (const view of ['ranks','ideas']) action(`market-tab-${view}`, () => { element('market-sources').hidden = view !== 'ranks'; element('market-ideas-panel').hidden = view !== 'ideas'; for (const name of ['ranks','ideas']) element(`market-tab-${name}`).classList.toggle('selected', name === view); });
   document.addEventListener('pointerdown', event => closeShelfMenus(event.target.closest?.('.shelf-menu')));
   document.addEventListener('keydown', event => { if (event.key === 'Escape') closeShelfMenus(null, true); });
@@ -1318,7 +1324,7 @@ function bind() {
     try { const book = await api('/api/books', { request: element('request').value, title: element('title').value, chapter_count: Number(element('chapter-count').value), target_words: Number(element('target-words').value), mode: state.api ? 'api' : 'host', project: projectIntake() }); await shelf(); await selectBook(book.book_id); if (element('start-on-create').checked) await continueWriting(); }
     catch (error) { notice(error.message); } finally { button.disabled = false; }
   });
-  action('new-book', async () => { if (state.dirty && !confirm('编辑尚未保存，继续开书会丢失本地修改。继续？')) return; state.selection++; state.book = null; state.chapter = null; state.status = null; state.dirty = false; element('app-shell').classList.remove('writing-focused'); storage('removeItem', 'hulk-book'); element('workspace').hidden = true; element('onboarding').hidden = false; element('breadcrumb-title').textContent = '新建作品'; element('save-state').textContent = '本地存储'; renderShelf(); });
+  action('new-book', async () => { if (state.dirty && !confirm('编辑尚未保存，继续开书会丢失本地修改。继续？')) return; state.selection++; state.book = null; state.chapter = null; state.status = null; state.dirty = false; element('app-shell').classList.remove('writing-focused'); storage('removeItem', 'hulk-book'); element('workspace').hidden = true; element('onboarding').hidden = false; element('breadcrumb-title').textContent = '新建作品'; element('save-state').textContent = '本地存储'; renderShelf(); authorAssistant?.contextChanged(); });
   action('preview-proposals', async () => {
     const request = element('request').value.trim(); if (!request) throw new Error('先写下一句话设想，再生成开书方向。');
     const result = await api('/api/proposals', { request, project: projectIntake() }); renderOpeningProposals(result);

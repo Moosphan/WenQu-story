@@ -19,10 +19,17 @@ from .providers import OpenAICompatible, configured_provider, run_worker
 from .service import StoryService
 from .runtime import WorkbenchRuntime
 from .tts import EdgeTTSService
+from . import author_assistant
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra='forbid')
+
+
+class AssistantRequest(StrictModel):
+    message: str = Field(min_length=1, max_length=12000)
+    expected_revision: int = Field(ge=0, strict=True)
+    chapter_number: int | None = Field(default=None, ge=1, strict=True)
 
 
 class OpenRequest(StrictModel):
@@ -263,6 +270,7 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
     async def lifespan(app):
         with runtime.server_lock():
             runtime.recover()
+            author_assistant.recover(service)
             try:
                 yield
             finally:
@@ -322,6 +330,27 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
     @app.exception_handler(StoryError)
     async def story_error(request, error):
         return JSONResponse({'detail':error.as_dict()},status_code=404 if error.code=='NOT_FOUND' else 409 if error.code in ('STALE_REVISION','INVALID_LEASE','RUN_ACTIVE','TASK_BUSY','WORKER_RUNNING') else 503 if error.code in ('TTS_UNAVAILABLE','TTS_FAILED','TTS_EMPTY_AUDIO') else 400)
+
+    @app.get('/api/books/{book_id}/assistant')
+    def assistant_history(book_id: str):
+        return author_assistant.history(service, book_id)
+
+    @app.post('/api/books/{book_id}/assistant')
+    def assistant_send(book_id: str, body: AssistantRequest):
+        turn = author_assistant.begin(service, book_id, **body.model_dump())
+        try:
+            provider = configured_provider(settings=ai_settings)
+            threading.Thread(target=author_assistant.execute, args=(service, book_id, turn['id'], provider), daemon=True).start()
+        except Exception as error:
+            author_assistant.fail(service, book_id, turn['id'], error)
+            return next(item for item in author_assistant.history(service, book_id)['turns'] if item['id'] == turn['id'])
+        return turn
+
+    @app.post('/api/books/{book_id}/assistant/{turn_id}/apply')
+    def assistant_apply(book_id: str, turn_id: str):
+        result = author_assistant.apply(service, book_id, turn_id)
+        dispatch_planning(book_id)
+        return result
 
     @app.get('/api/ai-config')
     def ai_config():

@@ -13,6 +13,8 @@ def progress(conn, book, run):
     previous = book.get('plan') or {}
     # Existing manuscript/candidate chapters retain their accepted skeleton.
     boundary = run['chapter_number'] if run.get('candidate') else run['chapter_number'] - 1
+    saved = conn.execute('SELECT COALESCE(MAX(number),0) FROM chapters WHERE book_id=?', (book['book_id'],)).fetchone()[0]
+    boundary = max(boundary, saved)
     chapters = []
     for chapter in previous.get('chapters', []):
         if chapter['number'] != len(chapters)+1 or chapter['number'] > min(boundary, total):
@@ -38,7 +40,10 @@ def progress(conn, book, run):
 
 def prepare(conn, book, run, data):
     from .settings_planning import pending
-    if book['settings']['chapter_count'] <= 40 and not pending(conn, book['book_id']):
+    job = pending(conn, book['book_id'])
+    if job and job['target'].get('direction'):
+        data['instruction'] += '\n作者已确认的全书规划方向（每批均须遵循）：' + job['target']['direction'] + '\n每批必须给出覆盖全书的完整卷纲 volumes；保留已写正文与候选章节的既有事实。'
+    if book['settings']['chapter_count'] <= 40 and not job:
         return
     assembled, seed = progress(conn, book, run)
     start = len(assembled['chapters']) + 1
@@ -76,3 +81,23 @@ def assemble(conn, book, run, inputs, result):
     if complete:
         validate('outline', assembled, book, result_size_limit=100000*((batch['total']+SIZE-1)//SIZE))
     return assembled, complete
+
+
+def validate_proposal_volumes(result, total):
+    """A global replan must carry a contiguous full-book volume roadmap each batch."""
+    volumes = result.get('volumes') if isinstance(result, dict) else None
+    if not isinstance(volumes, list) or not volumes:
+        raise StoryError('INVALID_RESULT', '全书重规划必须提供覆盖全书的完整卷纲。')
+    previous = 0
+    for volume in volumes:
+        if not isinstance(volume, dict):
+            raise StoryError('INVALID_RESULT', '卷纲格式无效。')
+        bounds = volume.get('range', [volume.get('start_chapter'), volume.get('end_chapter')])
+        if not isinstance(bounds, list) or len(bounds) != 2 or any(type(n) is not int for n in bounds):
+            raise StoryError('INVALID_RESULT', '卷纲章节范围无效。')
+        start, end = bounds
+        if start != previous + 1 or end < start or end > total:
+            raise StoryError('INVALID_RESULT', '卷纲必须连续覆盖全书，不能跳章、重叠或越界。')
+        previous = end
+    if previous != total:
+        raise StoryError('INVALID_RESULT', '卷纲必须覆盖到全书最后一章。')

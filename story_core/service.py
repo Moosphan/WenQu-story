@@ -540,7 +540,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             if not conn.execute('SELECT 1 FROM book_trash WHERE book_id=?', (book_id,)).fetchone():
                 raise StoryError('DELETE_FORBIDDEN', '只能彻底删除回收站中的作品。')
             delete_semantic_book(conn, book_id)
-            for table in ('settings_planning_jobs', 'workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports', 'book_trash'):
+            for table in ('author_assistant_turns', 'settings_planning_jobs', 'workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports', 'book_trash'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
         purge_semantic_files(self.store, book_id)
@@ -572,7 +572,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             if conn.execute("SELECT 1 FROM runs WHERE book_id=? AND status IN ('running','paused','needs_attention','awaiting_author')", (book_id,)).fetchone():
                 raise StoryError('RUN_ACTIVE', '请先结束该样例的进行中任务。')
             delete_semantic_book(conn, book_id)
-            for table in ('settings_planning_jobs', 'workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports'):
+            for table in ('author_assistant_turns', 'settings_planning_jobs', 'workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
         purge_semantic_files(self.store, book_id)
@@ -1207,6 +1207,9 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             stage=task['stage']
             planning_job = settings_planning.pending(conn, book['book_id'])
             book = settings_planning.virtual_book(conn, book)
+            if stage == 'outline' and planning_job and planning_job['target'].get('direction'):
+                from .outline_batches import validate_proposal_volumes
+                validate_proposal_volumes(result, book['settings']['chapter_count'])
             processing_result, warning = validate_output(stage, result, book, run['candidate'], json.loads(task['input']))
             if warning:
                 self.store.event(conn, book['book_id'], 'supplement_rejected',

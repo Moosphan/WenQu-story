@@ -20,7 +20,7 @@ def test_upgrade_from_real_legacy_table_set_keeps_manuscript_and_memory(tmp_path
     for _ in range(2):
         store = Store(tmp_path)
         with store.read() as conn:
-            assert conn.execute('PRAGMA user_version').fetchone()[0] == 11
+            assert conn.execute('PRAGMA user_version').fetchone()[0] == 12
             assert conn.execute('SELECT body FROM chapter_versions').fetchone()[0] == '铜牌还未归还。'
             assert conn.execute('SELECT id FROM memories').fetchone()[0] == 'm'
             assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='lm_promise_status_events'").fetchone()
