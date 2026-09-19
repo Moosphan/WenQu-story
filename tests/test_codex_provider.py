@@ -83,12 +83,17 @@ assert args[args.index('--sandbox')+1] == 'read-only'
 assert 'features.shell_tool=false' in args
 assert 'tools.update_plan.enabled=false' in args
 assert 'tools.update_plan=false' not in args
+assert 'model_provider="wenqu"' in args
+assert any('supports_websockets=false' in arg for arg in args)
 assert 'CODEX_API_KEY' not in os.environ
 schema=json.loads(pathlib.Path(args[args.index('--output-schema')+1]).read_text())
 assert schema['type']=='object'
 payload=json.loads(sys.stdin.read())
 assert payload['task']['instruction']=='synthetic task'
 mode=os.environ.get('WENQU_FAKE_CODEX_MODE','success')
+if mode=='warnings':
+ print(json.dumps({'type':'item.completed','item':{'type':'error','message':'Startup deprecation warning'}}))
+ print(json.dumps({'type':'error','message':'Reconnecting...'}))
 if mode=='sleep': time.sleep(30)
 if mode=='exit': print('SECRET', file=sys.stderr); sys.exit(2)
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'not-json' if mode=='invalid' else json.dumps({'result':json.dumps({'answer':'完成'})})}}))
@@ -127,6 +132,12 @@ def test_codex_failed_results_never_return_prose(fake_codex, monkeypatch, mode, 
         provider.generate(task())
     assert error.value.code == code
     assert 'SECRET' not in str(error.value.as_dict())
+
+
+def test_codex_completed_turn_survives_nonfatal_warnings(fake_codex, monkeypatch):
+    from story_core.codex_host import CodexCLI
+    monkeypatch.setenv('WENQU_FAKE_CODEX_MODE', 'warnings')
+    assert CodexCLI(model='explicit-model').generate(task()) == {'answer': '完成'}
 
 
 @pytest.mark.parametrize('cancel', [True, False])

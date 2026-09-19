@@ -67,7 +67,9 @@ class CodexCLI(ClaudeCode):
                        '-c', 'web_search="disabled"', '-c', 'project_doc_max_bytes=0',
                        '-c', 'developer_instructions=' + json.dumps(system), '-c', 'mcp_servers={}',
                        '-c', 'agents.enabled=false', '-c', 'tools.update_plan.enabled=false',
-                       '-c', 'tools.experimental_request_user_input.enabled=false']
+                       '-c', 'tools.experimental_request_user_input.enabled=false',
+                       '-c', 'model_provider="wenqu"',
+                       '-c', 'model_providers.wenqu={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false}']
             for feature in ('shell_tool', 'unified_exec', 'apply_patch_freeform', 'apps', 'plugins',
                             'hooks', 'codex_hooks', 'plugin_hooks', 'multi_agent', 'multi_agent_v2',
                             'js_repl', 'code_mode', 'computer_use', 'browser_use', 'image_generation',
@@ -88,13 +90,15 @@ class CodexCLI(ClaudeCode):
                 if not line.strip():
                     continue
                 event = json.loads(line)
-                if event.get('type') in ('turn.failed', 'error'):
+                # Generic error events also carry recovered reconnects; item errors
+                # include nonfatal startup warnings. The terminal turn decides success.
+                if event.get('type') == 'turn.failed':
                     failed = True
                 if event.get('type') == 'item.completed':
                     item = event.get('item') or {}
                     if item.get('type') == 'agent_message':
                         result = item.get('text')
-                    elif item.get('type') not in ('reasoning', 'plan'):
+                    elif item.get('type') not in ('reasoning', 'plan', 'error'):
                         failed = True
                 if event.get('type') == 'turn.completed':
                     completed = True
