@@ -79,7 +79,6 @@ CREATE TABLE IF NOT EXISTS workbench_executions (
  status TEXT NOT NULL, error TEXT, started_at REAL NOT NULL, finished_at REAL);
 CREATE INDEX IF NOT EXISTS workbench_execution_history ON workbench_executions(book_id,started_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS one_workbench_execution ON workbench_executions(book_id) WHERE status='running';
-PRAGMA user_version = 7;
 """
 
 
@@ -89,7 +88,7 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "project.sqlite"
         with self.connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 7:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 10:
                 raise StoryError("NEWER_DATABASE", "数据库版本高于当前程序，请升级程序。")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
@@ -100,7 +99,19 @@ class Store:
                 conn.execute("ALTER TABLE books ADD COLUMN project TEXT NOT NULL DEFAULT '{}'")
             conn.execute("UPDATE books SET kind='user' WHERE kind IS NULL")
             conn.execute("UPDATE books SET project='{}' WHERE project IS NULL")
-            conn.execute("PRAGMA user_version = 7")
+            from .long_memory import SCHEMA as LONG_MEMORY_SCHEMA
+            conn.executescript(LONG_MEMORY_SCHEMA)
+            from .memory_identity import SCHEMA as MEMORY_IDENTITY_SCHEMA
+            conn.executescript(MEMORY_IDENTITY_SCHEMA)
+            from .memory_summaries import SCHEMA as MEMORY_SUMMARY_SCHEMA
+            conn.executescript(MEMORY_SUMMARY_SCHEMA)
+            from .book_branches import SCHEMA as BOOK_BRANCH_SCHEMA
+            conn.executescript(BOOK_BRANCH_SCHEMA)
+            from .memory_workflow import SCHEMA as MEMORY_WORKFLOW_SCHEMA
+            conn.executescript(MEMORY_WORKFLOW_SCHEMA)
+            from .memory_repair import SCHEMA as MEMORY_REPAIR_SCHEMA
+            conn.executescript(MEMORY_REPAIR_SCHEMA)
+            conn.execute("PRAGMA user_version = 10")
 
     def connect(self):
         conn = sqlite3.connect(self.path, timeout=20, isolation_level=None)

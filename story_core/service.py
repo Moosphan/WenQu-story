@@ -4,9 +4,14 @@ import json
 import shutil
 import time
 from difflib import SequenceMatcher
+from dataclasses import replace
 from pathlib import Path
 
 from .model_context import model_input
+from .context_compiler import ContextCompiler, ContextPolicy
+from .context_metrics import context_usage
+from .task_context import ContextActions, prepare_lookup
+from .memory_actions import MemoryActions
 from .errors import StoryError
 from .result_boundary import validate_output
 from .targeted_revision import materialize
@@ -164,6 +169,19 @@ def _run(row):
     return result
 
 
+def _initial_retrieval_query(book, run):
+    if run['stage'] == 'reader':
+        return (run.get('candidate') or {}).get('body', '')[:1000]
+    plan = next((item for item in (book.get('plan') or {}).get('chapters', [])
+                 if item['number'] == run['chapter_number']), {})
+    return ' '.join([*(str(plan.get(key) or '') for key in ('goal', 'conflict', 'change', 'pov')),
+                     *plan.get('participants', [])])[:1000]
+
+
+def _retrieval_snapshot(book, run):
+    return (book['revision'], run['run_id'], run['stage'], run['chapter_number'], dumps(run.get('candidate')))
+
+
 def _task(row):
     result = dict(row)
     result['task_id'] = result.pop('id')
@@ -174,7 +192,13 @@ def _task(row):
     return result
 
 
-class StoryService:
+from .memory_summaries import SummaryActions
+from .book_branches import BranchActions
+from .memory_repair import RepairActions
+from .memory_promises import PromiseActions
+
+
+class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions, RepairActions, PromiseActions):
     def __init__(self, root):
         self.store = Store(root)
 
@@ -344,6 +368,42 @@ class StoryService:
                                       dict(genre=genre, chapter_count=chapter_count, target_words=target_words, mode=mode),
                                       validate_project_metadata(project or {}))
 
+    def update_book_settings(self, book_id, title=None, chapter_count=None, target_words=None, expected_revision=None):
+        if title is not None and (not isinstance(title, str) or not title.strip() or len(title.strip()) > 100):
+            raise StoryError('INVALID_REQUEST', '书名应为 1–100 个字符。')
+        for value, low, high in [(chapter_count, 1, 200), (target_words, 50, 6000)]:
+            if value is not None and (type(value) is not int or not low <= value <= high):
+                raise StoryError('INVALID_REQUEST', '章节数或字数超出支持范围。')
+        with self.store.write(book_id, expected_revision=expected_revision) as conn:
+            book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
+            last = conn.execute('SELECT COALESCE(MAX(number),0) FROM chapters WHERE book_id=?', (book_id,)).fetchone()[0]
+            run = self._latest_run(conn, book_id)
+            active = run and run['status'] in ('running', 'paused', 'needs_attention', 'awaiting_author')
+            minimum = max(last, run['chapter_number'] if active else 0)
+            if chapter_count is not None and chapter_count < minimum:
+                raise StoryError('INVALID_REQUEST', f'章节总数不能少于已保存正文或当前任务所在的第 {minimum} 章。')
+            settings = dict(book['settings'])
+            if chapter_count is not None:
+                settings['chapter_count'] = chapter_count
+            if target_words is not None:
+                settings['target_words'] = target_words
+            title = title.strip() if title is not None else book['title']
+            brief = dict(book['brief']) if book['brief'] else None
+            if brief:
+                brief['title'] = title
+            replan = settings['chapter_count'] != book['settings']['chapter_count'] and bool(book['plan'])
+            if active:
+                conn.execute("UPDATE tasks SET status='cancelled' WHERE run_id=? AND status='leased'", (run['run_id'],))
+                conn.execute("UPDATE workbench_executions SET status='cancelled',finished_at=? WHERE run_id=? AND status='running'", (time.time(), run['run_id']))
+                stage = 'outline' if replan else run['stage']
+                conn.execute("UPDATE runs SET status=?,stage=?,end_chapter=?,reason=? WHERE id=?", ('awaiting_author' if run['status'] == 'awaiting_author' else 'paused', stage, min(run['end_chapter'], settings['chapter_count']), '作品设置已更新，继续写作将使用新设置。', run['run_id']))
+            conn.execute('UPDATE books SET title=?,config=?,brief=?,ending=NULL,revision=revision+1 WHERE id=?',
+                         (title, dumps(settings), dumps(brief) if brief else None, book_id))
+            if replan and not active:
+                conn.execute("UPDATE books SET status='draft' WHERE id=?", (book_id,))
+            self.store.event(conn, book_id, 'book_settings_updated', {'settings': settings, 'replan': replan})
+            return {'book_id': book_id, 'title': title, 'settings': settings, 'revision': book['revision'] + 1, 'replan': replan, 'run_paused': bool(active)}
+
     def project_metadata(self, book_id):
         return self.get_book(book_id)['project']
 
@@ -408,25 +468,39 @@ class StoryService:
         conn.execute('UPDATE books SET request=?,project=? WHERE id=?', (replace(book['request']), dumps(replace(book['project'])), book['book_id']))
         return replace(brief), replace(plan), renames, count
 
-    def update_story_bible(self, book_id, brief, plan, expected_revision=None):
+    def update_story_bible(self, book_id, brief, plan, expected_revision=None, *, settings=None, apply_character_renames=False):
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise StoryError('INVALID_REQUEST', '作品版本必须是非负整数。')
         with self.store.write(book_id, expected_revision=expected_revision) as conn:
             book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
+            if settings is not None and (not isinstance(settings, dict) or set(settings) - {'chapter_count', 'target_words'}):
+                raise StoryError('INVALID_REQUEST', '作品设置仅支持章节总数和后续章节字数。')
+            if type(apply_character_renames) is not bool:
+                raise StoryError('INVALID_REQUEST', '历史人物改名选项必须为布尔值。')
+            updated_settings = {**book['settings'], **(settings or {})}
+            if type(updated_settings['chapter_count']) is not int or not book['settings']['chapter_count'] <= updated_settings['chapter_count'] <= 200:
+                raise StoryError('INVALID_REQUEST', '章节总数只能扩展，且不能超过 200 章。')
+            if type(updated_settings['target_words']) is not int or not 50 <= updated_settings['target_words'] <= 6000:
+                raise StoryError('INVALID_REQUEST', '后续章节字数须为 50–6000 的整数。')
+            book = {**book, 'settings': updated_settings}
             validate('brief', brief, book)
             validate('outline', plan, book)
-            brief, plan, renames, renamed_chapters = self._rename_story_characters(conn, book, brief, plan)
+            renames, renamed_chapters = {}, 0
+            if apply_character_renames:
+                brief, plan, renames, renamed_chapters = self._rename_story_characters(conn, book, brief, plan)
             run = self._latest_run(conn, book_id)
-            if run and run['status'] in ('running', 'paused', 'needs_attention'):
+            run_cancelled = bool(run and run['status'] in ('running', 'paused', 'needs_attention', 'awaiting_author'))
+            if run_cancelled:
                 conn.execute("UPDATE runs SET status='cancelled',reason='故事约定或章节骨架已由作者更新，需要使用新上下文重新开始。' WHERE id=?", (run['run_id'],))
                 conn.execute("UPDATE tasks SET status='cancelled' WHERE run_id=? AND status='leased'", (run['run_id'],))
-            conn.execute("UPDATE books SET title=?,brief=?,plan=?,status='draft',revision=revision+1,ending=NULL WHERE id=?",
-                         (brief['title'], dumps(brief), dumps(plan), book_id))
-            self.store.event(conn, book_id, 'story_bible_updated', {'revision_from': book['revision'], 'cancelled_run': bool(run and run['status'] in ('running', 'paused', 'needs_attention'))})
+                conn.execute("UPDATE workbench_executions SET status='cancelled',finished_at=? WHERE run_id=? AND status='running'", (time.time(), run['run_id']))
+            conn.execute("UPDATE books SET title=?,brief=?,plan=?,config=?,status='draft',revision=revision+1,ending=NULL WHERE id=?",
+                         (brief['title'], dumps(brief), dumps(plan), dumps(updated_settings), book_id))
+            self.store.event(conn, book_id, 'story_bible_updated', {'revision_from': book['revision'], 'cancelled_run': run_cancelled, 'settings': updated_settings})
             saved = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
             return {'book_id': book_id, 'title': saved['title'], 'brief': saved['brief'], 'plan': saved['plan'],
                     'renamed_characters': renames, 'renamed_chapters': renamed_chapters,
-                    'revision': saved['revision'], 'run_cancelled': bool(run and run['status'] in ('running', 'paused', 'needs_attention'))}
+                    'settings': saved['settings'], 'revision': saved['revision'], 'run_cancelled': run_cancelled}
 
     def list_books(self, kind='all'):
         if kind not in ('all', 'user', 'sample', 'archived'):
@@ -454,12 +528,15 @@ class StoryService:
             return {'book_id': book_id, 'restored': True}
 
     def purge_book(self, book_id):
+        from .semantic_retrieval import delete_semantic_book, purge_semantic_files
         with self.store.write(book_id, allow_trash=True) as conn:
             if not conn.execute('SELECT 1 FROM book_trash WHERE book_id=?', (book_id,)).fetchone():
                 raise StoryError('DELETE_FORBIDDEN', '只能彻底删除回收站中的作品。')
+            delete_semantic_book(conn, book_id)
             for table in ('workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports', 'book_trash'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
+        purge_semantic_files(self.store, book_id)
         for category in ('tts-cache', 'exports'):
             parent = (self.store.root / category).resolve()
             folder = parent / book_id
@@ -480,16 +557,19 @@ class StoryService:
             return self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
 
     def delete_sample(self, book_id):
+        from .semantic_retrieval import delete_semantic_book, purge_semantic_files
         with self.store.write(book_id) as conn:
             row = conn.execute('SELECT kind FROM books WHERE id=?', (book_id,)).fetchone()
             if row['kind'] != 'sample':
                 raise StoryError('DELETE_FORBIDDEN', '只能删除标记为测试样例的作品。')
             if conn.execute("SELECT 1 FROM runs WHERE book_id=? AND status IN ('running','paused','needs_attention','awaiting_author')", (book_id,)).fetchone():
                 raise StoryError('RUN_ACTIVE', '请先结束该样例的进行中任务。')
+            delete_semantic_book(conn, book_id)
             for table in ('workbench_executions', 'human_reviews', 'tasks', 'memories', 'chunks', 'chapters', 'chapter_versions', 'runs', 'events', 'exports'):
                 conn.execute(f'DELETE FROM {table} WHERE book_id=?', (book_id,))
             conn.execute('DELETE FROM books WHERE id=?', (book_id,))
-            return {'book_id': book_id, 'deleted': True}
+        purge_semantic_files(self.store, book_id)
+        return {'book_id': book_id, 'deleted': True}
 
     def get_book(self, book_id):
         with self.store.read() as conn:
@@ -566,6 +646,8 @@ class StoryService:
         start = chapter or (first[0] if first else count + 1)
         end = total if chapter_limit is None else min(total, start + chapter_limit - 1)
         stage = 'brief' if not book['brief'] else 'outline' if not book['plan'] else 'extract' if candidate else 'ending' if start > total else 'draft'
+        if book['brief'] and book['plan'] and len(book['plan']['chapters']) != total:
+            stage = 'outline'
         repair = bool(chapter or first)
         if repair and not candidate and start <= total:
             ch = conn.execute('SELECT v.title,v.body FROM chapters c JOIN chapter_versions v ON v.id=c.version_id WHERE c.book_id=? AND c.number=?', (book['book_id'],start)).fetchone()
@@ -588,12 +670,16 @@ class StoryService:
                 raise StoryError('ARCHIVED_PROJECT', '已归档作品请先恢复到“我的作品”或“测试样例”，再继续写作。')
             return self._insert_run(conn,book,chapter_limit,max_steps,max_revisions,budget_tokens,review_mode=review_mode)
 
-    def _input(self, conn, book, run):
+    def _input(self, conn, book, run, policy=None, retrieval_query=None):
         stage, number = run['stage'], run['chapter_number']
         candidate = run['candidate']
         common = {'instruction': instruction(stage), 'chapter_number': number}
-        prior = [dict(r) for r in conn.execute('''SELECT c.number chapter_number,c.version_id,v.title,v.body FROM chapters c JOIN chapter_versions v ON v.id=c.version_id
-            WHERE c.book_id=? AND c.number<? AND c.status='committed' ORDER BY c.number''', (book['book_id'], number))]
+        adaptive = policy is not None and policy.mode == 'adaptive'
+        prior_query = '''SELECT c.number chapter_number,c.version_id,v.title,v.body FROM chapters c JOIN chapter_versions v ON v.id=c.version_id
+            WHERE c.book_id=? AND c.number<? AND c.status='committed' ORDER BY c.number'''
+        prior = [dict(r) for r in conn.execute(prior_query + (' DESC LIMIT 3' if adaptive else ''), (book['book_id'], number))]
+        if adaptive:
+            prior.reverse()
         # Reader never gets plans, hidden facts, author reviews or future chunks.
         if stage == 'reader':
             completed = {review.get('reader_profile') for review in run['reviews'] or [] if review.get('stage') == 'reader'}
@@ -602,7 +688,13 @@ class StoryService:
                 raise StoryError('INVALID_STATE', '当前候选稿的读者审稿已完成。')
             profile = reader_profile(profile_id)
             history = [{'chapter_number': c['chapter_number'], 'title': c['title'], 'body': c['body']} for c in prior[-3:]]
-            public = [m for m in canonical_memory(conn,book['book_id'],number-1) if m.get('visibility','reader')=='reader' and m['kind'] in ('summary','emotion','relationship')]
+            if adaptive:
+                from .retrieval import retriever_for, RetrievalScope
+                retrieved = retriever_for(self.store).search(retrieval_query if retrieval_query is not None else _initial_retrieval_query(book, run),
+                    RetrievalScope(book['book_id'], number-1, role='reader'), conn=conn, limit=12)
+                public = retrieved['hits']
+            else:
+                public = [m for m in canonical_memory(conn,book['book_id'],number-1) if m.get('visibility','reader')=='reader' and m['kind'] in ('summary','emotion','relationship')]
             return {**common, 'instruction': instruction('reader', profile_id), 'reader_profile': profile,
                     'candidate':candidate,'reader_history':history,'reader_memory':public,
                     'read_boundary':number,
@@ -624,14 +716,42 @@ class StoryService:
             return data
         data['brief'] = book['brief']
         if stage == 'outline':
+            if book['plan']:
+                data['previous_plan'] = book['plan']
+                data['instruction'] += '\n这是中途调整篇幅。保留已写章节的骨架与已发生事实，扩展或收束后续世界观、卷纲、章纲和伏笔；不要重写已完成正文。'
             data['context_manifest'] = _context_manifest(book, 'author', 0)
             return data
         data['chapter_plan'] = next((c for c in book['plan']['chapters'] if c['number']==number), None)
+        if stage in ('draft', 'revise', 'arc', 'ending'):
+            structure = {key: book['plan'][key] for key in ('payoff_design', 'climax', 'conflicts', 'reversals', 'joy_points', 'book_climaxes', 'conflicts_reversals') if book['plan'].get(key)}
+            volumes = [volume for volume in book['plan'].get('volumes', []) if
+                       volume.get('range', [volume.get('start_chapter'), volume.get('end_chapter')])[0] <= number <=
+                       volume.get('range', [volume.get('start_chapter'), volume.get('end_chapter')])[1]]
+            if volumes:
+                structure['volumes'] = volumes
+            if structure:
+                data['story_structure'] = structure
+                data['instruction'] += '\nstory_structure 是创作计划，不是已发生事实；只推进本章目标，不能提前兑现后续高潮或把伏笔计划当成记忆。'
         data['arc_window'] = [c for c in book['plan']['chapters'] if abs(c['number']-number)<=2]
         data['planned_promises'] = book['plan']['promises']
         memory_boundary = number if stage in ('ending', 'arc') else number - 1
-        memories = canonical_memory(conn,book['book_id'],memory_boundary)
+        if adaptive:
+            from .memory import selected_canonical_memory
+            memories = selected_canonical_memory(conn, book['book_id'], memory_boundary, kinds=['promise'])
+            from .retrieval import retriever_for, RetrievalScope
+            plan = data['chapter_plan'] or {}
+            if stage != 'extract':
+                query = retrieval_query if retrieval_query is not None else _initial_retrieval_query(book, run)
+                retrieved = retriever_for(self.store).search(query,
+                    RetrievalScope(book['book_id'], memory_boundary, pov=plan.get('pov')), conn=conn, limit=12)
+                data['historical_evidence'] = retrieved['hits']
+            if stage == 'extract':
+                memories += selected_canonical_memory(conn, book['book_id'], memory_boundary,
+                    kinds=['entity', 'fact', 'relationship', 'knowledge'], limit=64)
+        else:
+            memories = canonical_memory(conn,book['book_id'],memory_boundary)
         data['promise_obligations'] = promise_obligations(memories, book['plan'], number)
+        data['context_selection'] = {'settled_promise_ids': [m['key'] for m in memories if m.get('kind') == 'promise' and m.get('status') in ('paid', 'waived')]}
         layers = context_layers(memories, data['chapter_plan'] or {}, number)
         # Serialize the authoritative layer once; duplicate aliases inflate requests.
         data['required_memory'] = layers['required']
@@ -640,7 +760,7 @@ class StoryService:
         data['pov_context'] = layers['pov_guard']
         data['recent_chapters'] = prior[-2:]
         data['context_manifest'] = _context_manifest(book, 'author', memory_boundary,
-                                                      [*layers['required'], *layers['supplementary']], prior[-2:],
+                                                      [*layers['required'], *layers['supplementary'], *data.get('historical_evidence', [])], prior[-2:],
                                                       layers['required'], layers['supplementary'], layers['pov_guard'])
         if candidate:
             data['candidate'] = candidate
@@ -701,7 +821,7 @@ class StoryService:
             if candidate:
                 data['length_requirement']['current_count'] = word_count(candidate['body'])
             data['instruction'] += '\n按 length_requirement.target 写足本章，不以 min 为写作目标。计数不含标点空白；返修后的完整正文（包括应用 patches 后）也须满足范围。原稿不足时，补足本章目标内的尝试、阻力、对话交锋、结果及情绪余波；不能靠重复解释、回顾或无关支线凑字数。删除有问题的说明后保留必要场景，不把去AI味理解为持续缩短正文。length_feedback 是上次实际校验结果，重试须结合它调整正文，不能重复提交同样的删改。'
-            previous = conn.execute("SELECT id,input,status FROM tasks WHERE book_id=? AND run_id=? AND chapter_number=? AND stage=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            previous = conn.execute("SELECT id,input,status,base_revision FROM tasks WHERE book_id=? AND run_id=? AND chapter_number=? AND stage=? AND status!='lookup' ORDER BY created_at DESC,rowid DESC LIMIT 1",
                                     (book['book_id'], run['run_id'], number, stage)).fetchone()
             if previous and previous['status'] != 'submitted' and json.loads(previous['input']).get('candidate') == candidate:
                 for row in conn.execute("SELECT payload FROM events WHERE book_id=? AND kind IN ('task_result_rejected','worker_failed') ORDER BY seq DESC", (book['book_id'],)):
@@ -709,6 +829,22 @@ class StoryService:
                     if failure.get('task_id') == previous['id'] and failure.get('code') == 'WORD_COUNT' and failure.get('details'):
                         data['length_feedback'] = {'task_id': previous['id'], 'count': failure['details'].get('count'), **length_requirement(book['settings']['target_words'])}
                         break
+            if stage == 'draft' and previous and previous['status'] != 'submitted' and previous['base_revision'] == book['revision']:
+                for row in conn.execute("SELECT payload FROM events WHERE book_id=? AND run_id=? AND kind='task_result_rejected' ORDER BY seq DESC", (book['book_id'], run['run_id'])):
+                    failure = json.loads(row['payload'])
+                    if failure.get('task_id') != previous['id'] or failure.get('code') != 'WORD_COUNT':
+                        continue
+                    raw = failure.get('raw_result')
+                    if isinstance(raw, dict) and isinstance(raw.get('title'), str) and isinstance(raw.get('body'), str) and raw['body'].strip():
+                        count = word_count(raw['body'])
+                        bounds = data['length_requirement']
+                        data['length_repair_source'] = {'title': raw['title'], 'body': raw['body']}
+                        data['expansion_requirement'] = {'source_words': count,
+                            'minimum_additional_words': max(0, bounds['min'] - count),
+                            'target_additional_words': max(0, bounds['target'] - count)}
+                        direction = '在现有场景内部补足行动、阻力和对话，保留事件顺序和结局' if count < bounds['min'] else '压缩重复解释与铺垫，保留事件顺序和结局'
+                        data['instruction'] += f"\n本次是初稿长度修复，不是重新起稿。length_repair_source 是上次保存的完整正文，共 {count} 字。以它为底稿，{direction}，达到 {bounds['target']} 字附近。必须返回完整 title/body，不只返回新增段落、不返回修改建议，不得照原样重复提交。"
+                    break
         if stage == 'revise' and candidate:
             if previous and previous['status'] != 'submitted' and json.loads(previous['input']).get('candidate') == candidate:
                 data['revision_mode'] = 'full_body'
@@ -748,18 +884,76 @@ class StoryService:
         conn.execute("UPDATE books SET status='needs_attention' WHERE id=?",(run['book_id'],))
         self.store.event(conn,run['book_id'],'needs_attention',{'reason':reason},run['run_id'])
 
-    def _task_spec(self, conn, book, run):
-        data=self._input(conn,book,run)
+    def _task_spec(self, conn, book, run, policy=None, retrieval_query=None):
+        policy = policy or ContextPolicy.from_env(run['stage'], self.store.root / 'context-policy.json')
+        data=self._input(conn,book,run,policy,retrieval_query)
         schema = adjudication_schema(data['review_adjudication']) if data.get('review_adjudication') else REPAIR_SCHEMA if data.get('extraction_repair') else review_source_schema(run['candidate']) if run['stage'] == 'continuity' else SCHEMAS[run['stage']]
         if data.get('revision_mode') in ('expand_full_body', 'full_body'):
             schema = SCHEMAS['revise']['oneOf'][0]
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
         reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
+        policy = replace(policy, output_reserve=max(MAX_TASK_OUTPUT_TOKENS, policy.output_reserve))
+        if policy.mode == 'adaptive' and run['stage'] not in ('brief', 'outline'):
+            from .long_memory import current_state, resolve_alias, select_promises
+            plan = next((c for c in book['plan']['chapters'] if c['number'] == run['chapter_number']), {})
+            pov = plan.get('pov')
+            # An unresolved POV cannot gain author-only state or another belief.
+            pov_id = resolve_alias(conn, book['book_id'], pov) if pov else None
+            role = 'reader' if pov or run['stage'] == 'reader' else 'author'
+            if plan.get('entity_ids') and 'story_time' in plan:
+                data['current_state'] = current_state(conn, book['book_id'], plan['entity_ids'],
+                    through_chapter=run['chapter_number']-1, story_time=plan['story_time'], role=role, pov_entity_id=pov_id)
+                if run['stage'] != 'extract':
+                    from .memory_relations import related_evidence
+                    related = related_evidence(conn, book['book_id'], plan['entity_ids'],
+                        through_chapter=run['chapter_number']-1, story_time=plan['story_time'], role=role, pov_entity_id=pov_id)
+                    data.setdefault('historical_evidence', []).extend(related)
+            scheduled = select_promises(conn, book['book_id'], run['chapter_number'],
+                explicit_ids=plan.get('promise_ids', []), trigger_keys=plan.get('trigger_keys', []), role=role, pov_entity_id=pov_id,
+                story_time=plan.get('story_time'))
+            data['scheduled_promises'] = scheduled['required']
+            if run['stage'] != 'extract':
+                from .memory_summaries import select_summaries
+                # An unresolved POV cannot inherit unrestricted author summaries.
+                data['semantic_summaries'] = select_summaries(conn, book['book_id'],
+                    through_chapter=run['chapter_number'] if run['stage'] in ('arc', 'ending') else run['chapter_number']-1,
+                    role=role, pov_entity_id=(pov_id or 'unresolved-pov') if pov else None)
+            # Reader/extraction views intentionally lack author chapter_plan.
+            # Keep only dependency IDs, never its future plot text.
+            data['context_required_ids'] = [*plan.get('required_fact_ids', []), *plan.get('promise_ids', [])]
+            from .dependency_resolution import resolve_dependencies, attach_dependencies
+            resolved = resolve_dependencies(conn, book['book_id'], plan, run['stage'], run['chapter_number'],
+                role=role, pov_entity_id=pov_id)
+            attach_dependencies(data, resolved)
+        data, schema = prepare_lookup(conn, book, run, data, schema, policy)
+        compiled = ContextCompiler(policy).compile(data, schema, stage=run['stage'])
+        manifest = data.get('context_manifest')
+        data = compiled.input
+        if manifest is not None:
+            data['context_manifest'] = manifest
+        data['context_diagnostics'] = compiled.diagnostics
+        # Shadow/off preserve the existing financial reservation and gates.
+        if compiled.diagnostics['mode'] == 'adaptive':
+            reservation = compiled.reservation
         return data, schema, reservation
 
     def next_task(self, book_id, worker_id='host'):
         if not isinstance(worker_id,str) or not worker_id or len(worker_id)>100:
             raise StoryError('INVALID_REQUEST','worker_id 无效。')
+        prepared, selected_policy = None, None
+        with self.store.read() as read_conn:
+            snapshot_row = read_conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone()
+            if snapshot_row is None:
+                raise StoryError('NOT_FOUND', '找不到这本书。')
+            snapshot_book = self.store.decode_book(snapshot_row)
+            snapshot_run = self._latest_run(read_conn, book_id)
+            active_lease = read_conn.execute("SELECT 1 FROM tasks WHERE book_id=? AND status='leased' AND lease_until>? LIMIT 1",
+                                            (book_id, time.time())).fetchone()
+        if snapshot_run and snapshot_run['status'] == 'running' and not active_lease:
+            selected_policy = ContextPolicy.from_env(snapshot_run['stage'], self.store.root / 'context-policy.json')
+            if selected_policy.mode == 'adaptive' and snapshot_run['stage'] not in ('brief', 'outline', 'extract'):
+                from .retrieval import retriever_for
+                prepared = retriever_for(self.store).prepare_query(_initial_retrieval_query(snapshot_book, snapshot_run))
         with self.store.write(book_id) as conn:
             run = self._latest_run(conn,book_id)
             session = conn.execute('SELECT status,run_id FROM workbench_executions WHERE id=?', (worker_id,)).fetchone()
@@ -776,12 +970,21 @@ class StoryService:
                 if task['worker_id']==worker_id:
                     return _task(task)
                 return {'task_id':None,'status':'leased','lease_until':task['lease_until']}
-            data, schema, reservation = self._task_spec(conn, book, run)
+            if (active_lease or snapshot_run is None
+                    or _retrieval_snapshot(book, run) != _retrieval_snapshot(snapshot_book, snapshot_run)):
+                raise StoryError('STALE_REVISION', '检索准备期间作品或任务已变化，请重新领取。')
+            data, schema, reservation = self._task_spec(conn, book, run, selected_policy, prepared)
+            if not data['context_diagnostics']['executable']:
+                self._attention(conn,run,'本阶段上下文容量不足，请检查上下文诊断。')
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'], 'stage':run['stage'], 'chapter_number':run['chapter_number']},run['run_id'])
+                return {'task_id':None,'status':'needs_attention','reason':'context_capacity'}
             if run['steps']>=run['max_steps'] or run['tokens']+reservation>run['budget_tokens']:
                 self._attention(conn,run,'步骤或 token 预留预算不足；可提高预算后继续。')
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'financial_budget', 'reservation':reservation, 'stage':run['stage'], 'chapter_number':run['chapter_number']},run['run_id'])
                 return {'task_id':None,'status':'needs_attention','reason':'budget'}
             if len(dumps(model_input(data)).encode())>180000:
                 self._attention(conn,run,'上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。')
+                self.store.event(conn,book_id,'context_blocked',{'context':data['context_diagnostics'],'gate':'transport_bytes', 'input_bytes':len(dumps(model_input(data)).encode()), 'stage':run['stage'], 'chapter_number':run['chapter_number']},run['run_id'])
                 return {'task_id':None,'status':'needs_attention','reason':'context_limit'}
             if task:
                 conn.execute("UPDATE tasks SET status='expired' WHERE id=?",(task['id'],))
@@ -790,6 +993,7 @@ class StoryService:
                           VALUES (?,?,?,?,?,?,?,?,'leased',?,?,?,?)''',
                          (task_id,run['run_id'],book_id,run['stage'],run['chapter_number'],dumps(data),dumps(schema),book['revision'],worker_id,lease_id,now+LEASE_SECONDS,now))
             conn.execute('UPDATE runs SET steps=steps+1,tokens=tokens+? WHERE id=?',(reservation,run['run_id']))
+            self.store.event(conn,book_id,'context_compiled',{'task_id':task_id,'context':data['context_diagnostics']},run['run_id'])
             self.store.event(conn,book_id,'task_leased',{'task_id':task_id,'stage':run['stage'],'reserved_tokens':reservation},run['run_id'])
             return _task(conn.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone())
 
@@ -891,7 +1095,10 @@ class StoryService:
         conn.execute('INSERT INTO chapter_versions VALUES (?,?,?,?,?,?)',(version,book['book_id'],number,candidate['title'],candidate['body'],time.time()))
         conn.execute("INSERT INTO chapters VALUES (?,?,?,'committed') ON CONFLICT(book_id,number) DO UPDATE SET version_id=excluded.version_id,status='committed'",(book['book_id'],number,version))
         index_chapter(conn,book['book_id'],number,version,candidate['body'],run['extraction']['memories'])
+        from .memory_workflow import enqueue_maintenance
+        enqueue_maintenance(conn, book['book_id'], version)
         if old:
+            enqueue_maintenance(conn, book['book_id'], old[0], invalidated=True)
             conn.execute("UPDATE chapters SET status='needs_review' WHERE book_id=? AND number>? AND status='committed'",(book['book_id'],number))
         conn.execute('UPDATE books SET revision=revision+1,ending=NULL WHERE id=?',(book['book_id'],))
         self.store.event(conn,book['book_id'],'chapter_committed',{'chapter_number':number,'version_id':version,'replaces':old[0] if old else None},run['run_id'])
@@ -915,6 +1122,10 @@ class StoryService:
 
     def submit_task(self, task_id, lease_id, result, worker_id='host'):
         try:
+            if isinstance(result, dict) and 'context_lookup' in result:
+                if set(result) != {'context_lookup'} or not isinstance(result['context_lookup'], dict) or set(result['context_lookup']) != {'query','reason'}:
+                    raise StoryError('INVALID_LOOKUP', '补查须单独提交 query 与 reason。')
+                return self.lookup_task(task_id, lease_id, **result['context_lookup'], worker_id=worker_id)
             return self._submit_task(task_id, lease_id, result, worker_id)
         except StoryError as failure:
             # The validation transaction rolled back. Retain only a live, owned,
@@ -956,6 +1167,8 @@ class StoryService:
                 raise StoryError('INVALID_LEASE','任务租约或执行者不匹配。')
             if task['stage'] == 'extract':
                 inputs = json.loads(task['input'])
+                if len(json.dumps(result, ensure_ascii=False).encode()) > 100000:
+                    raise StoryError('INVALID_RESULT', '单次任务原始结果过大。', {'phase': 'result_validation', 'next_action': '减少重复记忆，仅提交本章新增且有证据的条目。'})
                 result = resolve_sources(merge_extraction(result, inputs.get('extraction_repair')), inputs.get('candidate'))
             if task['stage'] == 'continuity' and json.loads(task['input']).get('review_adjudication'):
                 inputs = json.loads(task['input'])
@@ -1052,15 +1265,41 @@ class StoryService:
                 payload['details']=details
             self.store.event(conn, task['book_id'], 'worker_failed', payload, run['run_id'])
 
-    def query(self,book_id,query,role='author',through_chapter=None,limit=10,task_id=None,lease_id=None):
+    def query(self,book_id,query,role='author',through_chapter=None,limit=10,task_id=None,lease_id=None,strategy='legacy'):
+        pov = None
         if task_id or lease_id:
             with self.store.read() as conn:
                 task=conn.execute('SELECT * FROM tasks WHERE id=? AND book_id=?',(task_id,book_id)).fetchone()
                 if not task or task['lease_id']!=lease_id or task['status']!='leased' or task['lease_until']<time.time():
                     raise StoryError('INVALID_LEASE','检索凭据失效。')
-                if task['stage']=='reader':
-                    if role!='reader' or through_chapter is None or through_chapter>task['chapter_number']:
-                        raise StoryError('INVALID_SCOPE','读者任务禁止访问作者资料或未来章节。')
+                run = conn.execute('SELECT status FROM runs WHERE id=?', (task['run_id'],)).fetchone()
+                if run['status'] != 'running':
+                    raise StoryError('INVALID_LEASE', '检索任务已暂停或失效。')
+                book = self.store.book(book_id)
+                if task['base_revision'] != book['revision']:
+                    raise StoryError('STALE_REVISION', '作品已更新，请重新领取任务。')
+                if task['stage'] == 'reader' and role != 'reader':
+                    raise StoryError('INVALID_SCOPE', '读者任务禁止读取作者资料。')
+                boundary = max(0, task['chapter_number'] - 1)
+                if through_chapter is not None and (type(through_chapter) is not int or not 0 <= through_chapter <= boundary):
+                    raise StoryError('INVALID_SCOPE', '任务检索只能读取当前章之前的资料。')
+                through_chapter = boundary if through_chapter is None else through_chapter
+                pov = (json.loads(task['input']).get('pov_context') or {}).get('pov')
+                # Scoped task queries use the same source/POV filter as lookup.
+                strategy = 'bounded'
+        if strategy == 'bounded':
+            from .retrieval import RetrievalScope, retriever_for
+            if role == 'reader' and through_chapter is None:
+                raise StoryError('INVALID_SCOPE', '读者检索必须指定已读章节。')
+            result = retriever_for(self.store).search(query, RetrievalScope(book_id,
+                through_chapter=through_chapter if through_chapter is not None else 2**31,
+                role=role, pov=pov), limit=limit)
+            result['hits'] = [{**hit, 'text': f"{hit['key']}：{hit['value']}",
+                'chapter_number': hit['source']['chapter_number'],
+                'source': {**hit['source'], 'quote': hit.get('evidence', '')}} for hit in result['hits']]
+            return {**result, 'role': role, 'through_chapter': through_chapter}
+        if strategy != 'legacy':
+            raise StoryError('INVALID_REQUEST', '未知检索策略。')
         return retrieve(self.store,book_id,query,role,through_chapter,limit)
 
     def _token_usage(self, conn, book_id):
@@ -1136,20 +1375,48 @@ class StoryService:
                            'failure_details':failure_details,
                            'started_at':task['created_at'],'elapsed_seconds':max(0, int((related['created_at'] if related else now)-task['created_at']))}
             blocker = None
-            if run and run['status'] == 'needs_attention' and run.get('reason') == '步骤或 token 预留预算不足；可提高预算后继续。':
-                _, _, reservation = self._task_spec(conn, book, run)
-                blocker = {'code': 'BUDGET_LIMIT', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
-                           'reserved_tokens': run['tokens'], 'budget_tokens': run['budget_tokens'],
-                           'next_reservation': reservation, 'minimum_budget_tokens': run['tokens'] + reservation,
-                           'steps': run['steps'], 'max_steps': run['max_steps'], 'minimum_max_steps': run['steps'] + 1}
-            if run and run['status'] == 'needs_attention' and run.get('reason') == '上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。':
-                context, _, _ = self._task_spec(conn, book, run)
-                blocker = {'code': 'CONTEXT_LIMIT', 'chapter_number': run['chapter_number'], 'stage': run['stage'],
-                           'input_bytes': len(dumps(model_input(context)).encode()), 'limit_bytes': 180000}
+            reasons = {
+                '步骤或 token 预留预算不足；可提高预算后继续。': 'BUDGET_LIMIT',
+                '上下文超过 MVP 安全上限，需要缩小篇幅或人工整理记忆。': 'CONTEXT_LIMIT',
+                '本阶段上下文容量不足，请检查上下文诊断。': 'CONTEXT_CAPACITY',
+            }
+            if run and run['status'] == 'needs_attention' and run.get('reason') in reasons:
+                code = reasons[run['reason']]
+                saved = conn.execute("SELECT payload FROM events WHERE run_id=? AND kind='context_blocked' ORDER BY seq DESC LIMIT 1",
+                                     (run['run_id'],)).fetchone()
+                measurement = json.loads(saved[0]) if saved else {}
+                if (measurement.get('stage') != run['stage']
+                        or measurement.get('chapter_number') != run['chapter_number']):
+                    measurement = {}
+                required = {'BUDGET_LIMIT': 'reservation', 'CONTEXT_LIMIT': 'input_bytes', 'CONTEXT_CAPACITY': 'context'}[code]
+                # Older runs lack persisted measurements. Lexical compilation remains
+                # local; never load an embedding model from a status read.
+                if required not in measurement:
+                    from .semantic_retrieval import load_policy
+                    try:
+                        lexical = load_policy(self.store)['strategy'] == 'lexical'
+                    except StoryError:
+                        lexical = False
+                    if lexical:
+                        context, _, reservation = self._task_spec(conn, book, run)
+                        measurement = {'reservation': reservation, 'input_bytes': len(dumps(model_input(context)).encode()),
+                                       'context': context['context_diagnostics']}
+                blocker = {'code': code, 'chapter_number': run['chapter_number'], 'stage': run['stage']}
+                if required not in measurement:
+                    blocker['measurement_unavailable'] = True
+                    blocker['message'] = '旧任务未保存阻塞测量；恢复后重新领取任务可更新诊断。'
+                elif code == 'BUDGET_LIMIT':
+                    blocker.update(reserved_tokens=run['tokens'], budget_tokens=run['budget_tokens'],
+                        next_reservation=measurement['reservation'], minimum_budget_tokens=run['tokens'] + measurement['reservation'],
+                        steps=run['steps'], max_steps=run['max_steps'], minimum_max_steps=run['steps'] + 1)
+                elif code == 'CONTEXT_LIMIT':
+                    blocker.update(input_bytes=measurement['input_bytes'], limit_bytes=180000)
+                else:
+                    blocker['context'] = measurement['context']
             token_usage = self._token_usage(conn, book_id)
             return {'book_id':book_id,'title':book['title'],'status':book['status'],'revision':book['revision'],
                     'chapters':counts,'target_chapters':book['settings']['chapter_count'],'run':run,'events':events,
-                    'token_usage': token_usage, 'blocker': blocker,
+                    'token_usage': token_usage, 'blocker': blocker, 'context_usage': context_usage(conn, book_id),
                     'active_task': dict(active_task) if active_task else None,
                     'execution':execution,
                     'budget_note':'tokens 为保守预留量，含重领任务；不是服务商账单。'}

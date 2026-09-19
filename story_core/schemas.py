@@ -20,6 +20,11 @@ CHARACTER = obj({k: S for k in ("name", "desire", "fear", "boundary", "voice")})
 CHAPTER = obj({"number": {"type": "integer", "minimum": 1}, **{k:S for k in ("title", "goal", "conflict", "change", "payoff", "emotion")},
                "participants": {"type": "array", "items": S, "maxItems": 12, "uniqueItems": True}, "pov": S},
               ["number", "title", "goal", "conflict", "change", "payoff", "emotion"])
+# Optional explicit dependencies for trusted normalized-state integrations.
+# No model-produced assertion is automatically marked verified.
+for field in ('entity_ids', 'required_fact_ids', 'promise_ids', 'trigger_keys'):
+    CHAPTER['properties'][field] = {'type': 'array', 'items': S, 'uniqueItems': True}
+CHAPTER['properties']['story_time'] = {'type': 'number', 'description': '显式故事时间坐标；倒叙时不能用章节号替代。'}
 PROMISE = obj({"key": S, "setup_chapter": {"type": "integer", "minimum": 1}, "due_chapter": {"type": "integer", "minimum": 1}, "resolution": S, "mandatory": {"type": "boolean"}})
 MEMORY = obj({"kind": {"enum": ["fact", "entity", "relationship", "knowledge", "promise", "emotion", "timeline", "summary"]},
               "key": S, "value": S, "evidence": S, "visibility": {"enum": ["author", "reader"]},
@@ -47,9 +52,13 @@ MEMORY_SOURCE['properties']['evidence_paragraph'] = {'type': 'integer', 'minimum
 MEMORY_SOURCE['required'] = [key for key in MEMORY_SOURCE['required'] if key != 'evidence'] + ['evidence_paragraph']
 ISSUE = obj({"severity": {"enum": ["blocker", "major", "medium", "minor"]}, **{k:S for k in ("dimension", "evidence", "explanation", "suggestion")}})
 REVIEW = obj({"verdict": {"enum": ["pass", "revise"]}, "issues": {"type": "array", "items": ISSUE, "maxItems": 30}, "notes": TEXT})
+VOLUME = obj({"number":{"type":"integer","minimum":1},"title":TEXT,"range":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2},"goal":TEXT,"world_expansion":TEXT,"climax":TEXT}, ["number","title","range","goal","world_expansion","climax"])
+JOY = obj({"chapter":{"type":"integer","minimum":1},"type":TEXT,"setup":TEXT,"payoff":TEXT,"intensity":{"type":"integer","minimum":1,"maximum":5}}, ["chapter","type","setup","payoff","intensity"])
+CLIMAX = obj({"volume":{"type":"integer","minimum":1},"chapter":{"type":"integer","minimum":1},"title":TEXT,"description":TEXT,"setup":TEXT,"payoff":TEXT}, ["volume","chapter","title","description","setup","payoff"])
+CONFLICT = obj({"chapter":{"type":"integer","minimum":1},"conflict":TEXT,"reversal":TEXT,"cause":TEXT,"consequence":TEXT}, ["chapter","conflict","reversal","cause","consequence"])
 SCHEMAS = {
     "brief": obj({**{k:S for k in ("title", "premise", "audience", "pov", "style", "ending")}, "characters": {"type": "array", "items": CHARACTER, "minItems": 1, "maxItems": 20}}),
-    "outline": obj({"chapters": {"type": "array", "items": CHAPTER, "minItems": 1}, "promises": {"type": "array", "items": PROMISE}}),
+    "outline": obj({"chapters": {"type": "array", "items": CHAPTER, "minItems": 1}, "promises": {"type": "array", "items": PROMISE}, "volumes":{"type":"array","items":VOLUME},"joy_points":{"type":"array","items":JOY},"book_climaxes":{"type":"array","items":CLIMAX},"conflicts_reversals":{"type":"array","items":CONFLICT}}, ["chapters","promises"]),
     "draft": obj({"title": S, "body": S}), "revise": obj({"title": S, "body": S, "revision_response": {"type": "array", "maxItems": 150, "items": obj({"feedback_id": S, "status": {"enum": ["changed", "not_changed"]}, "explanation": S, "evidence": TEXT})}}, ["title", "body"]),
     "extract": obj({"memories": {"type": "array", "items": {"oneOf": [MEMORY, MEMORY_SOURCE]}, "maxItems": 30}}),
     "continuity": obj({**REVIEW['properties'], 'repair_target': {'enum': ['manuscript', 'memory']}, 'revision_verification': {'type': 'array', 'maxItems': 150, 'items': obj({'feedback_id': S, 'status': {'enum': ['verified', 'unresolved', 'uncertain']}, 'evidence': TEXT, 'explanation': S})}}, REVIEW['required']), "reader": REVIEW, "arc": REVIEW, "ending": REVIEW,
@@ -58,6 +67,14 @@ SCHEMAS = {
 PATCH_REVISION = obj({'title': S, 'patches': {'type': 'array', 'minItems': 1, 'maxItems': 20,
     'items': obj({'before': S, 'after': TEXT})}, 'revision_response': SCHEMAS['revise']['properties']['revision_response']}, ['patches'])
 SCHEMAS['revise'] = {'oneOf': [SCHEMAS['revise'], PATCH_REVISION]}
+SCHEMAS['outline']['properties'].update({
+    'volumes': {'type': 'array', 'maxItems': 200, 'items': obj({
+        'title': S, 'start_chapter': {'type': 'integer', 'minimum': 1},
+        'end_chapter': {'type': 'integer', 'minimum': 1}, 'goal': S, 'conflict': S, 'climax': S})},
+    'climax': TEXT,
+    **{key: {'type': 'array', 'items': S, 'maxItems': 200} for key in ('payoff_design', 'conflicts', 'reversals')},
+})
+SCHEMAS['outline']['properties']['volumes']['items'] = {'oneOf': [SCHEMAS['outline']['properties']['volumes']['items'], VOLUME]}
 
 
 def word_count(text):
@@ -81,6 +98,12 @@ def validate(stage, result, book, candidate=None):
         raise StoryError("INVALID_RESULT", "单次任务结果过大。")
     if stage == "outline":
         total = book["settings"]["chapter_count"]
+        previous_end = 0
+        for volume in result.get('volumes', []):
+            start, end = volume.get('range', [volume.get('start_chapter'), volume.get('end_chapter')])
+            if not previous_end < start <= end <= total:
+                raise StoryError('INVALID_RESULT', '卷纲章节范围须按顺序排列、不重叠且不超出全书。')
+            previous_end = end
         if [c["number"] for c in result["chapters"]] != list(range(1, total + 1)):
             raise StoryError("INVALID_RESULT", "章节规划必须覆盖整本书，编号连续。")
         for promise in result["promises"]:

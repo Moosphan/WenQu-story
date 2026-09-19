@@ -44,6 +44,23 @@ def test_retry_receives_length_error_and_preserves_candidate(tmp_path):
     assert artifact['details']['count'] == 40
 
 
+def test_draft_length_retry_uses_saved_prose_as_repair_source(tmp_path):
+    service, book = make(tmp_path)
+    task = to_stage(service, book, 'draft')
+    for size in (40, 60):
+        prose = {'title': '渡口', 'body': '字' * size}
+        with pytest.raises(StoryError) as error:
+            service.submit_task(task['task_id'], task['lease_id'], prose)
+        service.fail_task(task['task_id'], task['lease_id'], error.value)
+        service.control(book, 'resume')
+        task = service.next_task(book)
+        assert task['input']['length_repair_source'] == prose
+        assert task['input']['expansion_requirement']['target_additional_words'] == 80 - size
+        assert service.status(book)['run']['candidate'] is None
+    service.submit_task(task['task_id'], task['lease_id'], {'title': '渡口', 'body': '字' * 80})
+    assert service.status(book)['run']['stage'] == 'extract'
+
+
 def test_old_word_count_diagnostic_no_longer_suggests_protocol_replay():
     import subprocess
     from pathlib import Path

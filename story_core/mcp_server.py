@@ -58,9 +58,26 @@ def create_server(root: str | Path | None = None) -> FastMCP:
     def submit(task_id: str, lease_id: str, result: dict[str, Any], worker_id: str = "host") -> dict[str, Any]:
         return invoke(service.submit_task, task_id, lease_id, result, worker_id=worker_id)
 
+    @server.tool(name='story_lookup')
+    def lookup(task_id: str, lease_id: str, query: str, reason: str, worker_id: str = 'host') -> dict[str, Any]:
+        return invoke(service.lookup_task, task_id, lease_id, query, reason, worker_id=worker_id)
+
     @server.tool(name="story_query")
-    def query(book_id: str, query: str, role: str = "author", through_chapter: int | None = None, limit: int = 10, task_id: str | None = None, lease_id: str | None = None) -> dict[str, Any]:
-        return invoke(service.query, book_id, query, role=role, through_chapter=through_chapter, limit=limit, task_id=task_id, lease_id=lease_id)
+    def query(book_id: str, query: str, role: str = "author", through_chapter: int | None = None, limit: int = 10, task_id: str | None = None, lease_id: str | None = None, strategy: str = "legacy") -> dict[str, Any]:
+        return invoke(service.query, book_id, query, role=role, through_chapter=through_chapter, limit=limit, task_id=task_id, lease_id=lease_id, strategy=strategy)
+
+    @server.tool(name='story_memory_propose')
+    def memory_propose(book_id: str, candidates: list[dict[str, Any]], request_id: str) -> dict[str, Any]:
+        """Submit source-bound pending claims. Never grants author verification."""
+        return invoke(service.memory_propose, book_id, candidates, request_id=request_id)
+
+    @server.tool(name='story_memory_proposals')
+    def memory_proposals(book_id: str, status: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        return invoke(service.memory_proposals, book_id, status, limit, offset)
+
+    @server.tool(name='story_memory_entities')
+    def memory_entities(book_id: str, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        return invoke(service.memory_entities, book_id, limit, offset)
 
     @server.tool(name="story_memory_facets")
     def memory_facets(book_id: str) -> dict[str, Any]:

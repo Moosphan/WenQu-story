@@ -45,7 +45,7 @@ const ids=['overview','manuscript','planning','memory','activity'];
 const panels=ids.map(item),buttons=ids.map(item),fields=new Map();
 for(const id of ['workspace','focus-writing','app-shell'])fields.set(id,item(id));
 const saved={};
-const ctx=vm.createContext({document:{querySelectorAll(q){return q==='[data-tab]'?buttons:panels;},getElementById(id){return fields.get(id);}},localStorage:{setItem(k,v){saved[k]=v;}},Set});
+const ctx=vm.createContext({requestAnimationFrame(callback){callback();},document:{querySelectorAll(q){return q==='[data-tab]'?buttons:panels;},getElementById(id){return fields.get(id);}},localStorage:{setItem(k,v){saved[k]=v;}},Set});
 vm.runInContext(fs.readFileSync(process.argv[1],'utf8').replace(/initialize\(\);\s*$/,''),ctx);
 vm.runInContext("state.book={book_id:'book-a'};state.focused=true;switchTab('manuscript');",ctx);
 assert.equal(fields.get('app-shell').classList['writing-focused'],true);

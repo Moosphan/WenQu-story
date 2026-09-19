@@ -21,6 +21,19 @@ def test_memory_evidence_is_serialized_once_without_losing_provenance():
     assert model_input(data)['required_memory'][0]['source']['quote'] == '不同依据'
 
 
+def test_retrieval_diagnostics_stay_local_without_removing_story_fields():
+    from story_core.model_context import model_input
+    memory = {'key': '约定', 'value': '归还铜牌', 'evidence': '铜牌明日还你',
+              'context_reason': 'participant', 'source': {'chapter_number': 1}}
+    data = {'required_memory': [memory], 'supplementary_memory': [memory],
+            'candidate': {'body': 'context_reason 是正文中的文字'}}
+    sent = model_input(data)
+    for field in ('required_memory', 'supplementary_memory'):
+        assert sent[field] == [{key: value for key, value in memory.items() if key != 'context_reason'}]
+    assert data['required_memory'][0]['context_reason'] == 'participant'
+    assert sent['candidate'] == data['candidate']
+
+
 def test_context_blocker_identifies_pending_stage(tmp_path):
     from test_workflow import make
     service, book = make(tmp_path)
@@ -31,3 +44,14 @@ def test_context_blocker_identifies_pending_stage(tmp_path):
     assert status['blocker']['stage'] == status['run']['stage']
     assert status['blocker']['chapter_number'] == status['run']['chapter_number']
     assert status['blocker']['input_bytes'] > 0
+def test_retrieval_diagnostics_stay_local_without_removing_story_fields():
+    from story_core.model_context import model_input
+    memory = {'key': '约定', 'value': '归还铜牌', 'evidence': '铜牌明日还你',
+              'context_reason': 'participant', 'source': {'chapter_number': 1}}
+    data = {'required_memory': [memory], 'supplementary_memory': [memory],
+            'candidate': {'body': 'context_reason 是正文中的文字'}}
+    sent = model_input(data)
+    for field in ('required_memory', 'supplementary_memory'):
+        assert sent[field] == [{key: value for key, value in memory.items() if key != 'context_reason'}]
+    assert data['required_memory'][0]['context_reason'] == 'participant'
+    assert sent['candidate'] == data['candidate']

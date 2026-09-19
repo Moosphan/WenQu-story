@@ -1,5 +1,6 @@
 const element = id => document.getElementById(id);
 const state = { book: null, chapter: null, task: null, api: false, executor: 'manual', worker: false, dirty: false, books: [], reviews: [], candidateVersions: [], facets: {}, memoryFacet: '全部', versions: [], status: null, selection: 0, polling: false, busy: new Set(), editRevision: null, marketSources: new Set(), marketSelectionInitialized: false, aiConfig: null, activeView: 'overview', reviewView: 'reviews', focused: false, tts: { request: 0, objectUrl: '', key: '', playing: false }, ttsVoices: [] };
+let memoryOffset = 0;
 const statuses = { awaiting_author: '等待作者确认', new: '新作品', imported: '导入待审', writing: '写作中', running: '进行中', paused: '已暂停', needs_attention: '需要处理', complete: '已完结', draft: '未完稿', batch_complete: '本轮完成', cancelled: '已结束' };
 const stages = { brief: '建立创作约定', outline: '规划全书', draft: '写作正文', extract: '提取故事记忆', continuity: '核对连续性', reader: '读者审稿', arc: '故事弧审校', revise: '修改候选稿', ending: '全书完结审查', human: '真人反馈' };
 const readerProfiles = { target_reader: '目标题材读者', logic_reader: '逻辑敏感读者' };
@@ -137,12 +138,12 @@ async function loadTTSVoices() {
   const select = element('tts-voice'); if (!select) return; select.replaceChildren(); for (const voice of state.ttsVoices) { const option = document.createElement('option'); option.value = voice.id; option.textContent = voice.label; select.append(option); }
 }
 function empty(container, title, description, symbol = '◇') { container.replaceChildren(); const box = node('div', undefined, 'empty-state'); box.append(node('span', symbol, 'empty-symbol'), node('h3', title), node('p', description)); container.append(box); }
-async function api(path, body) {
+async function api(path, body, method = 'POST') {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 30000);
   try {
-    const response = await fetch(path, { signal: controller.signal, ...(body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) });
+    const response = await fetch(path, { signal: controller.signal, ...(body === undefined ? {} : { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) });
     const result = await response.json();
-    if (!response.ok) throw new Error(typeof result.detail === 'object' ? result.detail.message || display(result.detail) : result.detail || '请求失败');
+    if (!response.ok) { const error = new Error(typeof result.detail === 'object' ? result.detail.message || display(result.detail) : result.detail || '请求失败'); error.code = result.detail?.code; throw error; }
     return result;
   } catch (error) {
     if (error.name === 'AbortError' || error instanceof TypeError) throw new Error('无法连接本地服务。请确认服务已启动，然后刷新重试。');
@@ -187,6 +188,28 @@ function action(id, handler) {
     finally { state.busy.delete(id); element(id).disabled = false; controls(); }
   });
 }
+// Expand the manuscript into the page; only the page owns reading scroll.
+function fitManuscript() {
+  const body = element('chapter-body');
+  if (!body || !body.getClientRects().length) return;
+  body.style.height = 'auto';
+  body.style.height = `${Math.ceil(body.scrollHeight) + 2}px`;
+}
+function observeManuscript() {
+  const body = element('chapter-body');
+  body.addEventListener('input', fitManuscript);
+  let lastWidth = 0;
+  const observer = new ResizeObserver(entries => {
+    const width = entries[0].contentRect.width;
+    if (width > 0 && width !== lastWidth) {
+      lastWidth = width;
+      requestAnimationFrame(fitManuscript);
+    }
+  });
+  observer.observe(body);
+  window.addEventListener('resize', fitManuscript);
+  document.fonts?.ready.then(fitManuscript);
+}
 function switchTab(id) {
   if (!['overview', 'manuscript', 'planning', 'memory', 'activity'].includes(id)) id = 'overview';
   state.activeView = id;
@@ -196,6 +219,7 @@ function switchTab(id) {
   element('focus-writing').hidden = id !== 'manuscript';
   element('app-shell').classList.toggle('writing-focused', state.focused && id === 'manuscript');
   if (state.book) storage('setItem', `hulk-view-${state.book.book_id}`, id);
+  requestAnimationFrame(fitManuscript);
 }
 function switchReviewView(id) {
   if (!['reviews', 'versions', 'operations'].includes(id)) id = 'reviews';
@@ -235,7 +259,7 @@ function showLocalDraft() {
     const restore = node('button', '恢复本地编辑', 'primary small'); restore.type = 'button';
     restore.addEventListener('click', () => {
       if (!localDraftMatches(draft)) { showLocalDraft(); return; }
-      element('chapter-title').value = draft.title; element('chapter-body').value = draft.body; element('revision-feedback').value = draft.feedback;
+      element('chapter-title').value = draft.title; element('chapter-body').value = draft.body; requestAnimationFrame(fitManuscript); element('revision-feedback').value = draft.feedback;
       state.dirty = true; element('editor-word-count').textContent = `${countWords(draft.body)} 字 · 本地编辑中`;
       element('save-state').textContent = '本地编辑已恢复 · 尚未送审'; box.hidden = true; controls();
     }); box.append(restore);
@@ -294,15 +318,50 @@ function renderShelf() {
     const addAction = (label, callback, danger = false) => { const action = node('button', label, danger ? 'danger' : ''); action.type = 'button'; action.addEventListener('click', async () => { menu.open = false; try { await callback(); } catch (error) { notice(error.message); } }); actions.append(action); };
     addAction('打开作品', () => selectBook(book.book_id));
     addAction(book.book_kind === 'archived' ? '恢复到我的作品' : '归档作品', async () => { await api(`/api/books/${book.book_id}/kind`, {kind: book.book_kind === 'archived' ? 'user' : 'archived'}); await shelf(); });
-    addAction('移入回收站', async () => {
-      if (state.book?.book_id === book.book_id && state.dirty && !confirm('有未保存编辑，仍移入回收站？')) return;
-      await api(`/api/books/${book.book_id}/trash`, {});
-      if (state.book?.book_id === book.book_id) { state.dirty = false; resetTTSForChapter(null); element('new-book').click(); }
-      await shelf(); notice(`“${book.title}”已移入回收站，可随时还原。`);
-    }, true);
+    addAction('移入回收站', () => trashFromShelf(book), true);
     menu.append(actions); row.append(button, menu); element('books').append(row);
   }
   if (!element('books').children.length) element('books').append(node('p', search ? '没有找到这本作品' : '你的第一本书，等你落笔。', 'hint'));
+}
+async function trashFromShelf(book) {
+  if (state.book?.book_id === book.book_id && state.dirty && !confirm('有未保存编辑，仍移入回收站？')) return;
+  const dialog = node('dialog', undefined, 'shelf-trash-dialog');
+  const title = node('h2', `移入回收站 · ${book.title}`);
+  const message = node('p', '正在移入回收站…'); message.setAttribute('role', 'status');
+  const actions = node('div', undefined, 'dialog-actions');
+  const close = node('button', '关闭'); close.type = 'button';
+  const retry = node('button', '重试', 'primary'); retry.type = 'button'; retry.hidden = true;
+  let needsPause = false;
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => dialog.remove());
+  actions.append(close, retry); dialog.append(title, message, actions); document.body.append(dialog); dialog.showModal();
+  const attempt = async () => {
+    retry.disabled = true; close.disabled = true;
+    const preventCancel = event => event.preventDefault(); dialog.addEventListener('cancel', preventCancel);
+    try {
+      if (needsPause) {
+        message.textContent = '正在暂停写作，等待当前执行退出…';
+        await api(`/api/books/${book.book_id}/control`, {action: 'pause'});
+      }
+      for (let count = 0; ; count++) {
+        try { await api(`/api/books/${book.book_id}/trash`, {}); break; }
+        catch (error) {
+          if (!needsPause || error.code !== 'RUN_ACTIVE' || count >= 14) throw error;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+      if (state.book?.book_id === book.book_id) { state.dirty = false; resetTTSForChapter(null); element('new-book').click(); }
+      await shelf();
+      message.textContent = `“${book.title}”已移入回收站，正文和版本均保留，可从回收站还原。`;
+      retry.hidden = true; close.textContent = '完成';
+    } catch (error) {
+      needsPause = error.code === 'RUN_ACTIVE';
+      message.textContent = needsPause ? '该作品仍有写作任务。暂停后才能移入回收站；正文和续写断点会保留。若执行尚未退出，请稍后重试。' : error.message;
+      retry.textContent = needsPause ? '暂停写作并移入回收站' : '重试'; retry.hidden = false;
+    } finally { retry.disabled = false; close.disabled = false; dialog.removeEventListener('cancel', preventCancel); }
+  };
+  retry.addEventListener('click', attempt);
+  await attempt();
 }
 async function shelf() { state.books = await api(`/api/books?kind=${encodeURIComponent(element('book-filter').value)}`); renderShelf(); }
 async function showTrash() {
@@ -326,9 +385,27 @@ function renderPlanning() {
     for (const character of brief.characters || []) { const card = node('div', undefined, 'detail-block'); card.append(node('h3', character.name)); for (const field of ['desire', 'fear', 'boundary', 'voice']) card.append(node('p', `${labels[field]}：${character[field]}`)); grid.append(card); } element('brief').append(grid);
   }
   if (!state.book.plan) return;
+  const structure = state.book.plan;
+  element('plan').append(node('h3', '全书结构', 'subheading'));
+  for (const [field, title] of [['payoff_design', '爽点设计'], ['climax', '全书高潮'], ['conflicts', '核心冲突'], ['reversals', '关键反转']]) {
+    const value = structure[field]; const card = node('div', undefined, 'detail-block');
+    card.append(node('h3', title));
+    for (const text of (Array.isArray(value) ? value.length ? value : ['尚未填写'] : [value || '尚未填写'])) card.append(node('p', text));
+    element('plan').append(card);
+  }
+  element('plan').append(node('h3', '卷纲', 'subheading'));
+  if (!structure.volumes?.length) element('plan').append(node('p', '尚未填写卷纲，可在编辑器中补充。', 'hint'));
+  for (const volume of structure.volumes || []) {
+    const card = node('div', undefined, 'detail-block');
+    card.append(node('h3', `${volume.title} · 第 ${volume.start_chapter ?? volume.range?.[0]}–${volume.end_chapter ?? volume.range?.[1]} 章`));
+    for (const [key, label] of [['goal', '目标'], ['conflict', '冲突'], ['world_expansion', '世界拓展'], ['climax', '卷内高潮']]) if (volume[key]) card.append(node('p', `${label}：${volume[key]}`));
+    element('plan').append(card);
+  }
   element('plan').append(node('h3', '章节骨架', 'subheading'));
   for (const chapter of state.book.plan.chapters) { const card = node('details', undefined, 'outline-card'); const summary = node('summary'); summary.append(node('span', `第 ${chapter.number} 章`, 'outline-label'), node('span', chapter.title)); card.append(summary); if (chapter.pov) card.append(node('p', `本章视角：${chapter.pov}`)); for (const field of ['goal', 'conflict', 'change', 'payoff', 'emotion']) card.append(node('p', `${labels[field]}：${chapter[field]}`)); element('plan').append(card); }
   if (state.book.plan.promises.length) { element('plan').append(node('h3', '计划中的伏笔（尚非回收事实）', 'subheading')); for (const promise of state.book.plan.promises) { const card = node('div', undefined, 'detail-block'); card.append(node('strong', promise.key), node('p', `第 ${promise.setup_chapter} 章铺设 → 第 ${promise.due_chapter} 章计划回收`), node('p', promise.resolution)); element('plan').append(card); } }
+  const sections = [['joy_points','分章爽点设计'],['book_climaxes','高潮节点'],['conflicts_reversals','冲突与反转节点']];
+  for (const [key, title] of sections) { const items = state.book.plan[key] || []; if (!items.length) continue; element('plan').append(node('h3', title, 'subheading')); const box=node('div',undefined,'planning-grid'); for (const item of items) { const card=node('div',undefined,'detail-block'); card.append(node('strong', item.title || item.type || `第${item.chapter}章`)); const text=Object.entries(item).filter(([k])=>!['title','type','number','chapter'].includes(k)).map(([k,v])=>`${k}：${Array.isArray(v)?v.join('–'):v}`).join(' · '); card.append(node('p', text)); box.append(card); } element('plan').append(box); }
 }
 function candidateChapter(run = state.status?.run) {
   if (!run?.candidate || !['running', 'paused', 'needs_attention'].includes(run.status)) return null;
@@ -381,35 +458,54 @@ function projectPayload(prefix = 'project-') {
   };
 }
 function projectIntake() { return projectPayload(); }
-function bibleRows(value, required, label) {
+function bibleRows(value, required, label, allowEmpty = false) {
   return value.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
     const parts = line.split(/[|｜]/).map(part => part.trim());
-    if (parts.length !== required || parts.slice(0, required - 1).some(part => !part)) throw new Error(`${label}每行请用“｜”分隔 ${required} 项，前 ${required - 1} 项不能为空。`);
+    if (parts.length !== required || (!allowEmpty && parts.slice(0, required - 1).some(part => !part))) throw new Error(`${label}每行请用“｜”分隔 ${required} 项，前 ${required - 1} 项不能为空。`);
     return parts;
   });
 }
 function fillStoryBibleEditor(book = state.book) {
+  state.bibleSnapshot = JSON.parse(JSON.stringify(book));
   const brief = book?.brief || {}; const plan = book?.plan || {};
   const values = {
+    'chapter-count': book.settings.chapter_count, 'target-words': book.settings.target_words,
+    volumes: (plan.volumes || []).map(item => `${item.title}｜${item.start_chapter ?? item.range?.[0]}｜${item.end_chapter ?? item.range?.[1]}｜${item.goal}｜${item.conflict ?? item.world_expansion}｜${item.climax}`).join('\n'),
+    'payoff-design': (plan.payoff_design || []).join('\n'), climax: plan.climax || '',
+    conflicts: (plan.conflicts || []).join('\n'), reversals: (plan.reversals || []).join('\n'),
     title: brief.title || book?.title || '', premise: brief.premise || '', audience: brief.audience || '', pov: brief.pov || '', style: brief.style || '', ending: brief.ending || '',
     characters: (brief.characters || []).map(item => `${item.name}｜${item.desire}｜${item.fear}｜${item.boundary}｜${item.voice}`).join('\n'),
     chapters: (plan.chapters || []).map(item => `${item.number}｜${item.title}｜${item.goal}｜${item.conflict}｜${item.change}｜${item.payoff}｜${item.emotion}｜${item.pov || ''}`).join('\n'),
     promises: (plan.promises || []).map(item => `${item.key}｜${item.setup_chapter}｜${item.due_chapter}｜${item.resolution}｜${item.mandatory ? '是' : '否'}`).join('\n'),
   };
   for (const [name, value] of Object.entries(values)) element(`bible-${name}`).value = value;
+  element('bible-chapter-count').min = book.settings.chapter_count;
 }
 function storyBiblePayload() {
+  const original = state.bibleSnapshot;
+  if (!original || original.book_id !== state.book?.book_id) throw new Error('作品已切换，请重新打开编辑器。');
   const characters = bibleRows(element('bible-characters').value, 5, '人物').map(([name, desire, fear, boundary, voice]) => ({ name, desire, fear, boundary, voice }));
   const chapters = bibleRows(element('bible-chapters').value, 8, '章节骨架').map(([number, title, goal, conflict, change, payoff, emotion, pov]) => ({
-    number: Number(number), title, goal, conflict, change, payoff, emotion, ...(pov ? { pov } : {}),
+    ...(original.plan.chapters.find(item => item.number === Number(number)) || {}),
+    number: Number(number), title, goal, conflict, change, payoff, emotion, pov: pov || undefined,
   }));
   const promises = element('bible-promises').value.trim() ? bibleRows(element('bible-promises').value, 5, '伏笔').map(([key, setup, due, resolution, mandatory]) => {
     if (!['是', '否'].includes(mandatory)) throw new Error('伏笔最后一项请填写“是”或“否”。');
     return { key, setup_chapter: Number(setup), due_chapter: Number(due), resolution, mandatory: mandatory === '是' };
   }) : [];
   return {
+    expected_revision: original.revision, apply_character_renames: false,
+    settings: { chapter_count: Number(element('bible-chapter-count').value), target_words: Number(element('bible-target-words').value) },
     brief: { title: element('bible-title').value.trim(), premise: element('bible-premise').value.trim(), audience: element('bible-audience').value.trim(), pov: element('bible-pov').value.trim(), style: element('bible-style').value.trim(), ending: element('bible-ending').value.trim(), characters },
-    plan: { chapters, promises },
+    plan: { ...original.plan, chapters, promises,
+      volumes: bibleRows(element('bible-volumes').value, 6, '卷纲', true).map(([title, start, end, goal, conflict, climax], index) => original.plan.volumes?.[index]?.range
+        ? {...original.plan.volumes[index], title, range: [Number(start), Number(end)], goal, world_expansion: conflict, climax}
+        : {title, start_chapter: Number(start), end_chapter: Number(end), goal, conflict, climax}),
+      payoff_design: element('bible-payoff-design').value.split('\n').map(item => item.trim()).filter(Boolean),
+      climax: element('bible-climax').value.trim(),
+      conflicts: element('bible-conflicts').value.split('\n').map(item => item.trim()).filter(Boolean),
+      reversals: element('bible-reversals').value.split('\n').map(item => item.trim()).filter(Boolean),
+    },
   };
 }
 function openStoryBibleEditor() {
@@ -483,6 +579,7 @@ function selectChapter(chapter) {
   state.chapter = chapter; state.dirty = false; state.editRevision = state.book.revision;
   resetTTSForChapter(chapter);
   element('chapter-title').value = chapter.title; element('chapter-body').value = chapter.body;
+  requestAnimationFrame(fitManuscript);
   element('version-scope').textContent = `当前对比：第 ${chapter.chapter_number} 章 · ${chapter.title}。在写作页切换章节。`;
   const stage = state.status?.run?.stage;
   const tokenUsage = chapterTokenUsage(chapter.chapter_number);
@@ -501,7 +598,68 @@ async function selectBook(bookId) {
   element('downloads').hidden = true; element('task').textContent = ''; element('task-result').value = ''; renderContextInspector(null);
   empty(element('hits'), '从一个细节开始检索', '只有已通过审查的正文与记忆参与检索。', '⌕');
   storage('setItem', 'hulk-book', bookId); element('onboarding').hidden = true; element('workspace').hidden = false;
-  switchTab(storage('getItem', `hulk-view-${bookId}`) || 'overview'); renderBook(); renderShelf(); await Promise.all([refreshStatus(), loadFacets()]);
+  switchTab(storage('getItem', `hulk-view-${bookId}`) || 'overview'); renderBook(); renderShelf(); memoryOffset = 0; await Promise.all([refreshStatus(), loadFacets(), loadMemoryReview()]);
+}
+async function loadMemoryReview() {
+  if (!state.book) return;
+  const bookId = state.book.book_id, offset = memoryOffset, filter = element('memory-review-filter').value;
+  const base = `/api/books/${bookId}/memory`;
+  const [proposals, maintenance] = await Promise.all([api(`${base}/proposals?status=${filter}&limit=20&offset=${offset}`), api(`${base}/maintenance?limit=5`)]);
+  if (state.book?.book_id !== bookId || offset !== memoryOffset || filter !== element('memory-review-filter').value) return;
+  const source = element('memory-source'), selected = source.value;
+  source.replaceChildren();
+  for (const chapter of state.book.chapters.filter(item => item.status === 'committed')) {
+    const option = node('option', `第 ${chapter.chapter_number} 章 · ${chapter.title}`); option.value = chapter.version_id; source.append(option);
+  }
+  if ([...source.options].some(option => option.value === selected)) source.value = selected;
+  const box = element('memory-proposals'); box.replaceChildren();
+  if (!proposals.items.length) box.append(node('p', '这一页没有记录。', 'hint'));
+  for (const proposal of proposals.items) {
+    const data = proposal.candidate || {}, row = node('article', undefined, 'hit');
+    row.append(node('strong', `${proposal.subject_display_name || data.subject_alias || data.subject_entity_id || '未绑定实体'} · ${data.predicate || '无法识别属性'}：${typeof data.value === 'string' ? data.value : JSON.stringify(data.value)}`));
+    row.append(node('small', `第 ${data.source_chapter || '?'} 章 · 故事时间 ${data.story_valid_from ?? '未指定'} · ${data.visibility === 'author' ? '仅作者' : '读者可见'} · ${proposal.source_current ? '来源版本有效' : '来源失效或待检查'}`), node('blockquote', data.evidence || '无有效证据'));
+    const scopeName = { objective: '客观状态', character_belief: '角色信念', author_plan: '作者计划' };
+    row.append(node('small', `${scopeName[data.scope || 'objective'] || data.scope}${data.owner_entity_id ? ` · 所属角色：${proposal.owner_display_name || data.owner_entity_id}` : ''}${data.story_valid_to != null ? ` · 有效至故事时间 ${data.story_valid_to}` : ''}${data.subject_entity_id ? ` · 实体 ${data.subject_entity_id}` : ''}`));
+    if (proposal.reason) row.append(node('p', `隔离原因：${proposal.reason}`, 'hint'));
+    const act = (label, suffix, payload) => {
+      const button = node('button', label); button.type = 'button';
+      const requestId = crypto.randomUUID();
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          await api(`${base}/proposals/${proposal.id}/${suffix}`, { ...payload(), expected_revision: proposals.revision, request_id: requestId });
+          if (state.book?.book_id === bookId) { await refreshStatus(); await loadMemoryReview(); }
+        } catch (error) { notice(error.message); button.disabled = false; }
+      });
+      row.append(button); return button;
+    };
+    if (proposal.status === 'pending' && proposal.source_current) {
+      if (!data.subject_entity_id) {
+        const select = node('select'); select.setAttribute('aria-label', '明确选择对应实体');
+        for (const identity of proposal.identity_candidates) { const option = node('option', `${identity.display_name} · ${identity.id}`); option.value = identity.id; select.append(option); }
+        row.append(select);
+        const binding = act('绑定所选实体', 'bind', () => ({ entity_id: select.value })); binding.disabled = !select.options.length;
+      } else {
+        const trusted = node('input'); trusted.type = 'checkbox';
+        const trustLabel = node('label', '我已核实原文与这条说法的含义', 'memory-check'); trustLabel.prepend(trusted); row.append(trustLabel);
+        const conflict = node('input'); conflict.type = 'checkbox';
+        if (proposal.conflicts.length) {
+          row.append(node('p', `当前状态存在不同说法：${proposal.conflicts.map(item => JSON.stringify(item.value)).join('；')}`, 'hint'));
+          const label = node('label', '确认这条新说法替代该时间的冲突状态', 'memory-check'); label.prepend(conflict); row.append(label);
+        }
+        const accept = act('接受事实', 'decision', () => ({ decision: 'accept', trust: trusted.checked, allow_conflict: conflict.checked }));
+        const enable = () => { accept.disabled = !trusted.checked || (proposal.conflicts.length > 0 && !conflict.checked); };
+        trusted.addEventListener('change', enable); conflict.addEventListener('change', enable); enable();
+      }
+    }
+    if (proposal.status === 'pending') act('拒绝这条说法', 'decision', () => ({ decision: 'reject' }));
+    box.append(row);
+  }
+  element('memory-page').textContent = `共 ${proposals.total} 条 · 第 ${Math.floor(offset / 20) + 1} 页`;
+  element('memory-previous').disabled = offset === 0;
+  element('memory-next').disabled = offset + 20 >= proposals.total;
+  const counts = maintenance.counts;
+  element('memory-maintenance-status').textContent = `待整理 ${counts.pending || 0} · 已整理 ${counts.ready || 0} · 仍待核实 ${counts.needs_verification || 0} · 已替换 ${counts.superseded || 0} · 失败 ${counts.failed || 0}`;
 }
 function renderMemoryFacets() {
   const box = element('memory-facets'); box.replaceChildren();
@@ -519,6 +677,17 @@ function renderContextInspector(task = state.task) {
   const inspector = element('context-inspector'); const sources = element('context-sources');
   inspector.hidden = !task?.task_id; sources.replaceChildren();
   if (!task?.task_id) return;
+  const context = task.input?.context_diagnostics;
+  if (context) {
+    const group = node('section', undefined, 'context-group');
+    group.append(node('span', `上下文用量 · ${context.mode === 'shadow' ? '影子测量' : context.mode === 'off' ? '旧策略' : '自适应装箱'}`, 'field-label'));
+    group.append(node('p', `${context.estimated ? '保守估算' : 'Token 计数'} ${formatTokens(context.final_tokens)} · 软目标 ${formatTokens(context.soft_target)} · 输出预留 ${formatTokens(context.output_reserve)} · 其他开销预留 ${formatTokens(context.overhead_reserve)}`, 'hint'));
+    group.append(node('p', `模型窗口：${context.context_window ? formatTokens(context.context_window) : '尚未配置'} · 整理后 ${formatTokens(context.organized_tokens)} · ${context.mode === 'shadow' ? '仅测量，当前请求未裁剪' : '各层可借用空余额度'}`, 'hint'));
+    const layerNames = { core: '核心约定', plan: '本章规划', state: '状态', obligations: '义务', recent: '近期承接', history: '历史证据', stage: '阶段资料' };
+    group.append(node('p', Object.entries(context.layer_tokens || {}).map(([key, value]) => `${layerNames[key] || key} ${formatTokens(value)}`).join(' · '), 'hint'));
+    if (context.missing_hard_ids?.length) group.append(node('p', `缺少明确依赖：${context.missing_hard_ids.join('、')}`, 'hint'));
+    sources.append(group);
+  }
   const manifest = task.input?.context_manifest;
   if (!manifest) { element('context-summary').textContent = '当前任务没有可用上下文清单'; sources.append(node('p', '这不会授予额外检索权限。', 'hint')); return; }
   const role = manifest.role === 'reader' ? '读者任务' : '作者任务';
@@ -705,6 +874,13 @@ function renderExecutionSummary() {
     return;
   }
   const blocker = state.status?.blocker;
+  if (blocker?.code === 'CONTEXT_CAPACITY') {
+    const context = blocker.context || {};
+    box.classList.add('is-failed'); title.textContent = `尚未启动：第 ${blocker.chapter_number} 章 · ${stages[blocker.stage]}`;
+    const missing = context.missing_hard_ids?.length ? `待补齐依赖：${context.missing_hard_ids.join('、')}。` : '';
+    detail.textContent = `必要资料 ${formatTokens(context.hard_tokens)} · 输出预留 ${formatTokens(context.output_reserve)} · 其他开销预留 ${formatTokens(context.overhead_reserve)} · 模型窗口 ${context.context_window ? formatTokens(context.context_window) : '尚未配置'}。${missing}请核对模型容量或调整本章规划，已保存正文保留。`;
+    return;
+  }
   if (blocker?.code === 'CONTEXT_LIMIT') {
     box.classList.add('is-failed'); title.textContent = `尚未启动：第 ${blocker.chapter_number} 章 · ${stages[blocker.stage]}`;
     detail.textContent = `本地上下文检查拦截，尚未调用模型。当前请求 ${(blocker.input_bytes / 1024).toFixed(1)} KB，上限 ${(blocker.limit_bytes / 1024).toFixed(1)} KB。已保存正文和记忆均保留；这不是上一任务失败，也不是 Token 预算不足。`;
@@ -850,7 +1026,7 @@ async function refreshStatus() {
     const [status, history, candidates] = await Promise.all([api(`/api/books/${bookId}/status`), api(`/api/books/${bookId}/reviews?include_history=${includeHistory}`), api(`/api/books/${bookId}/candidates`)]);
     if (state.book?.book_id !== bookId || state.selection !== selection) return;
     state.status = status; state.reviews = history.reviews; state.candidateVersions = candidates.candidates; renderStatus(); renderReviews(); renderCandidateHistory(); renderOverview();
-    const summary = state.books.find(book => book.book_id === bookId); if (summary) { summary.status = status.status; renderShelf(); }
+    const summary = state.books.find(book => book.book_id === bookId); if (summary && summary.status !== status.status) { summary.status = status.status; if (!document.querySelector('.shelf-menu[open]')) renderShelf(); }
     if (status.revision !== state.book.revision) {
       if (state.dirty) { element('save-state').textContent = '作品已更新 · 本地编辑保留'; return; }
       const book = await api(`/api/books/${bookId}`);
@@ -1128,13 +1304,38 @@ function bind() {
   action('continue', continueWriting); action('save-revision', () => revise(false)); action('request-revision', () => revise(true));
   action('edit-project-material', async () => openProjectEditor());
   action('edit-story-bible', async () => openStoryBibleEditor());
+  let settingsSnapshot = null;
+  action('open-book-settings', () => {
+    if (!state.book) return;
+    settingsSnapshot = { bookId: state.book.book_id, revision: state.book.revision };
+    element('settings-title').value = state.book.title;
+    element('settings-chapters').value = state.book.settings.chapter_count;
+    element('settings-words').value = state.book.settings.target_words;
+    element('book-settings-error').textContent = '';
+    openDialog('book-settings-dialog');
+  });
+  element('book-settings-form').addEventListener('submit', async event => {
+    event.preventDefault(); if (!settingsSnapshot) return;
+    const button = element('save-book-settings'); if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const saved = await api(`/api/books/${settingsSnapshot.bookId}/settings`, {
+        title: element('settings-title').value.trim(), chapter_count: Number(element('settings-chapters').value),
+        target_words: Number(element('settings-words').value), expected_revision: settingsSnapshot.revision,
+      }, 'PATCH');
+      closeDialog('book-settings-dialog'); state.task = null;
+      await selectBook(saved.book_id);
+      notice(`作品设置已保存，原有正文保留。${saved.replan ? '继续写作时将先调整后续规划。' : ''}${saved.run_paused ? '当前任务已暂停，请继续写作以使用新设置。' : ''}`);
+    } catch (error) { element('book-settings-error').textContent = error.message; }
+    finally { button.disabled = false; }
+  });
   element('story-bible-form').addEventListener('submit', async event => {
     event.preventDefault(); if (!state.book) return;
     const button = element('save-story-bible'); if (state.busy.has(button.id)) return;
     state.busy.add(button.id); controls(); notice('');
     try {
       const payload = storyBiblePayload(); const bookId = state.book.book_id;
-      const saved = await api(`/api/books/${bookId}/story-bible`, { ...payload, expected_revision: state.book.revision });
+      const saved = await api(`/api/books/${bookId}/story-bible`, payload);
       closeDialog('story-bible-dialog'); state.task = null; renderContextInspector(null);
       await selectBook(bookId); const renames = Object.entries(saved.renamed_characters || {}).map(([oldName, newName]) => `${oldName} → ${newName}`).join('、'); notice(renames ? `已同步改名：${renames}。更新 ${saved.renamed_chapters} 章正文、记忆与续写资料，历史版本保留。请继续写作。` : '故事约定与章节骨架已保存。旧任务已停止，请基于新骨架继续写作。');
     } catch (error) { notice(error.message); }
@@ -1239,6 +1440,31 @@ function bind() {
     const result = await api(`/api/books/${state.book.book_id}/import`, { chapters, expected_revision: state.book.revision }); closeDialog('import-dialog'); element('import-files').value = ''; await selectBook(state.book.book_id); notice(`已导入 ${result.imported} 章待审原稿，可开始逆向建档与逐章审查。`);
   });
   for (const id of ['export', 'export-partial']) action(id, async () => { const manifest = await api(`/api/books/${state.book.book_id}/export`, { allow_partial: id === 'export-partial' }); const box = element('downloads'); box.replaceChildren(); box.hidden = false; box.append(node('p', manifest.complete ? '成稿已准备好，EPUB 可用于阅读器预览；发布前请完成作者审阅。' : '草稿已导出，文件保留未完稿标记，不提供 EPUB。')); const available = new Set(manifest.files.map(file => file.name)); for (const filename of ['manuscript.txt', 'manuscript.md', 'book.epub', 'manifest.json']) { if (!available.has(filename)) continue; const link = node('a', filename); link.href = `/api/exports/${manifest.export_id}/${filename}`; link.download = filename; box.append(link); } });
+  action('memory-refresh', loadMemoryReview);
+  action('memory-previous', async () => { memoryOffset = Math.max(0, memoryOffset - 20); await loadMemoryReview(); });
+  action('memory-next', async () => { memoryOffset += 20; await loadMemoryReview(); });
+  element('memory-review-filter').addEventListener('change', () => { memoryOffset = 0; loadMemoryReview().catch(error => notice(error.message)); });
+  action('memory-maintain', async () => {
+    const bookId = state.book.book_id;
+    const result = await api(`/api/books/${bookId}/memory/maintenance`, { limit: 5, backfill: true });
+    if (state.book?.book_id === bookId) { await loadMemoryReview(); notice(`已处理 ${result.processed} 项，尚有 ${result.backfill_remaining} 章未加入整理队列。`); }
+  });
+  element('memory-proposal-form').addEventListener('submit', async event => {
+    event.preventDefault(); const button = event.submitter, bookId = state.book.book_id;
+    const source = state.book.chapters.find(item => item.version_id === element('memory-source').value && item.status === 'committed');
+    if (!source) { notice('请先选择一章有效定稿。'); return; }
+    const candidate = { subject_alias: element('memory-subject').value.trim(), predicate: element('memory-predicate').value, value: element('memory-value').value,
+      source_version: source.version_id, source_chapter: source.chapter_number, story_valid_from: Number(element('memory-time').value),
+      visibility: element('memory-visibility').value, evidence: element('memory-evidence').value };
+    button.disabled = true;
+    try {
+      try { await api(`/api/books/${bookId}/memory/entities`, { name: candidate.subject_alias }); }
+      catch (error) { if (error.code !== 'AMBIGUOUS_ENTITY') throw error; }
+      const result = await api(`/api/books/${bookId}/memory/proposals`, { candidates: [candidate], request_id: crypto.randomUUID() });
+      if (state.book?.book_id === bookId) { memoryOffset = 0; element('memory-review-filter').value = result.quarantined.length ? 'quarantined' : 'pending'; await loadMemoryReview(); }
+      notice(result.quarantined.length ? '来源或字段需要检查，已保留在隔离列表。' : '已加入待核实列表。');
+    } catch (error) { notice(error.message); } finally { button.disabled = false; }
+  });
   element('human-feedback-form').addEventListener('submit', async event => {
     event.preventDefault(); const form = event.currentTarget; const chapter = state.chapter; const bookId = state.book?.book_id;
     if (!chapter || chapter.status !== 'committed') { notice('请先选择已定稿章节。'); return; }
@@ -1263,7 +1489,7 @@ function bind() {
   });
   element('query-form').addEventListener('submit', async event => {
     event.preventDefault(); const bookId = state.book.book_id; const button = event.submitter; button.disabled = true;
-    try { const role = element('query-role').value; const result = await api(`/api/books/${bookId}/query`, { query: element('query').value, role, through_chapter: role === 'reader' ? Number(element('query-boundary').value) : null }); if (bookId !== state.book?.book_id) return; element('hits').replaceChildren(); element('hits').className = ''; if (!result.hits.length) empty(element('hits'), '还没有相关的正式记忆', '试试别的关键词，或先完成当前正文的审查。'); for (const hit of result.hits) { const row = node('div', undefined, 'hit'); row.append(node('small', `第 ${hit.chapter_number} 章 · ${hit.kind} · 有原文证据`), node('p', hit.text), node('blockquote', hit.source.quote)); element('hits').append(row); } }
+    try { const role = element('query-role').value; const result = await api(`/api/books/${bookId}/query`, { query: element('query').value, strategy: element('query-strategy').value, role, through_chapter: role === 'reader' ? Number(element('query-boundary').value) : null }); if (bookId !== state.book?.book_id) return; element('hits').replaceChildren(); element('hits').className = ''; if (result.index_complete === false) element('hits').append(node('p', '记忆索引尚未补齐；没有命中表示未知。可在下方运行本地整理。', 'hint')); if (!result.hits.length) element('hits').append(node('p', '未找到相关记忆；没有命中表示未知，可尝试其他关键词。', 'hint')); for (const hit of result.hits) { const row = node('div', undefined, 'hit'); row.append(node('small', `第 ${hit.chapter_number} 章 · ${hit.kind} · 有原文证据`), node('p', hit.text), node('blockquote', hit.source.quote)); element('hits').append(row); } }
     catch (error) { notice(error.message); } finally { button.disabled = false; }
   });
   action('get-task', async () => { if (state.worker) { await continueWriting(); return; } state.task = await api(`/api/books/${state.book.book_id}/next`, {}); renderContextInspector(); element('task').textContent = display(state.task); });
@@ -1274,6 +1500,7 @@ function bind() {
 async function initialize() {
   if (location.protocol === 'file:') { element('app-shell').hidden = true; element('file-entry').hidden = false; return; }
   bind();
+  observeManuscript();
   try {
     const capabilities = await api('/api/capabilities'); state.api = capabilities.api_configured; state.worker = capabilities.worker_configured; state.executor = capabilities.executor;
     await loadTTSVoices();

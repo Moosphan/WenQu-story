@@ -163,7 +163,7 @@ def test_character_rename_updates_current_text_and_context_not_history(tmp_path)
     brief, plan = deepcopy(book['brief']), deepcopy(book['plan'])
     brief['characters'][0]['name'] = '谢停舟'
     plan['chapters'][0]['goal'] = old + '采药'
-    saved = service.update_story_bible(book_id, brief, plan, book['revision'])
+    saved = service.update_story_bible(book_id, brief, plan, book['revision'], apply_character_renames=True)
     assert saved['renamed_characters'] == {old: '谢停舟'}
     assert saved['plan']['chapters'][0]['goal'] == '谢停舟采药'
     with service.store.read() as conn:
