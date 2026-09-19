@@ -23,6 +23,30 @@ def test_all_pipeline_tasks_have_shadow_measurement_and_submission_is_not_rebudg
     assert service.status(book)['run']['candidate']['body']
 
 
+def test_library_context_policy_survives_restart_and_checks_actual_model(tmp_path, monkeypatch):
+    from story_core.service import StoryService
+    from story_core.context_compiler import compile_task
+    service, book = make(tmp_path)
+    (service.store.root / 'context-policy.json').write_text(json.dumps({
+        'mode': 'adaptive', 'context_window': 100000,
+        'model_windows': {'configured-model': 100000}}))
+    restarted = StoryService(service.store.root)
+    task = restarted.next_task(book)
+    assert task['input']['context_diagnostics']['mode'] == 'adaptive'
+    assert compile_task(task, model='configured-model').executable
+    assert not compile_task(task, model='unknown-model').executable
+    monkeypatch.setenv('HULK_CONTEXT_MODE', 'off')
+    restarted.submit_task(task['task_id'], task['lease_id'], result_for(task))
+    assert restarted.next_task(book)['input']['context_diagnostics']['mode'] == 'off'
+
+
+def test_invalid_library_policy_cannot_silently_fall_back_to_shadow(tmp_path):
+    service, book = make(tmp_path)
+    (service.store.root / 'context-policy.json').write_text('{broken')
+    with pytest.raises(StoryError, match='上下文'):
+        service.next_task(book)
+
+
 def test_shadow_tiny_capacity_adds_no_new_lease_block_and_off_rolls_back(tmp_path, monkeypatch):
     monkeypatch.setenv('HULK_CONTEXT_WINDOW_TOKENS', '1')
     service, book = make(tmp_path)
@@ -197,12 +221,12 @@ def test_metrics_separate_missing_dependencies_unknown_capacity_and_shadow(tmp_p
     usage = service.status(book)['context_usage']
     assert usage['measured_requests'] == 4
     assert usage['organization_triggers'] == 1
-    assert usage['organized_unexecutable'] == 2
+    assert usage['organized_unexecutable'] == 3
     assert usage['assessed_executability_requests'] == 3
-    assert usage['organized_unexecutable_rate'] == 2 / 3
+    assert usage['organized_unexecutable_rate'] == 1
     assert usage['unknown_capacity_requests'] == 2
     assert usage['missing_hard_dependency_requests'] == 1
-    assert usage['capacity_overflow_requests'] == 1
+    assert usage['capacity_overflow_requests'] == 2
     assert usage['operational_blocked_requests'] == 2
     assert usage['key_fact_omission_rate'] is None
 

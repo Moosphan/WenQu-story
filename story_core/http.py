@@ -137,6 +137,14 @@ class StoryBibleRequest(StrictModel):
     brief: dict
     plan: dict
     expected_revision: int | None = None
+    settings: dict | None = None
+    apply_character_renames: bool = False
+
+class BookSettingsRequest(StrictModel):
+    title: str | None = None
+    chapter_count: int | None = Field(default=None, ge=1, le=200)
+    target_words: int | None = Field(default=None, ge=50, le=6000)
+    expected_revision: int | None = None
 
 
 class MarketIdeasRequest(StrictModel):
@@ -298,7 +306,12 @@ def create_app(root='./books', frame_ancestors=None, ai_settings=None, tts_servi
 
     @app.post('/api/books/{book_id}/story-bible')
     def update_story_bible(book_id: str, body: StoryBibleRequest):
-        return service.update_story_bible(book_id, body.brief, body.plan, body.expected_revision)
+        return service.update_story_bible(book_id, body.brief, body.plan, body.expected_revision,
+                                          settings=body.settings, apply_character_renames=body.apply_character_renames)
+
+    @app.patch('/api/books/{book_id}/settings')
+    def update_settings(book_id: str, body: BookSettingsRequest):
+        return service.update_book_settings(book_id, **body.model_dump())
 
     @app.get('/api/books/{book_id}/status')
     def status(book_id: str):

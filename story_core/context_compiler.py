@@ -13,6 +13,7 @@ import os
 from typing import Protocol
 
 from .errors import StoryError
+from .memory import _terms, _memory_search_text
 from .model_context import model_input
 from .storage import dumps
 
@@ -44,8 +45,13 @@ class ContextPolicy:
     context_window: int | None = None
     output_reserve: int = 12000
     overhead_reserve: int = 4000
+    model_windows: dict | None = None
 
     def __post_init__(self):
+        if self.model_windows is not None and (not isinstance(self.model_windows, dict) or
+                any(not isinstance(name, str) or not name or type(size) is not int or size <= 0
+                    for name, size in self.model_windows.items())):
+            raise StoryError('INVALID_CONTEXT_POLICY', '上下文模型容量必须为模型名到正整数的映射。')
         if self.mode not in ('off', 'shadow', 'adaptive'):
             raise StoryError('INVALID_CONTEXT_POLICY', '上下文模式必须为 off、shadow 或 adaptive。')
         for key in ('soft_target', 'output_reserve', 'overhead_reserve', 'context_window'):
@@ -56,8 +62,21 @@ class ContextPolicy:
                 raise StoryError('INVALID_CONTEXT_POLICY', f'{key} 必须是有效 token 数。')
 
     @classmethod
-    def from_env(cls, stage='draft'):
-        values = {'mode': os.environ.get('HULK_CONTEXT_MODE', 'shadow')}
+    def from_env(cls, stage='draft', path=None):
+        values = {}
+        if path is not None and path.exists():
+            try:
+                values = json.loads(path.read_text(encoding='utf-8'))
+                if not isinstance(values, dict) or set(values) - set(cls.__dataclass_fields__):
+                    raise ValueError()
+            except (OSError, ValueError):
+                raise StoryError('INVALID_CONTEXT_POLICY', '书库上下文配置 context-policy.json 无效。') from None
+        values['mode'] = os.environ.get('HULK_CONTEXT_MODE', values.get('mode', 'shadow'))
+        if 'HULK_CONTEXT_MODEL_WINDOWS' in os.environ:
+            try:
+                values['model_windows'] = json.loads(os.environ['HULK_CONTEXT_MODEL_WINDOWS'])
+            except ValueError:
+                raise StoryError('INVALID_CONTEXT_POLICY', '上下文模型容量配置不是有效 JSON。') from None
         for key, env in (('soft_target', 'HULK_CONTEXT_SOFT_TOKENS'), ('context_window', 'HULK_CONTEXT_WINDOW_TOKENS'),
                          ('output_reserve', 'HULK_CONTEXT_OUTPUT_TOKENS'), ('overhead_reserve', 'HULK_CONTEXT_OVERHEAD_TOKENS')):
             if env in os.environ:
@@ -111,7 +130,8 @@ def _layer(key):
 
 def organize(data, selection=None, *, stage='draft'):
     """Return a hard core and ranked optional atoms, preserving hard records whole."""
-    core = deepcopy(data)
+    core = deepcopy({key: value for key, value in data.items()
+                     if key not in ('context_manifest', 'context_diagnostics', 'context_selection')})
     plan = core.get('chapter_plan') or {}
     number = core.get('chapter_number', 1)
     references = set(plan.get('required_fact_ids', [])) | set(plan.get('promise_ids', [])) | set(core.get('context_required_ids', []))
@@ -198,7 +218,18 @@ def organize(data, selection=None, *, stage='draft'):
         hard_promises = [p for p in whole_plan.get('promises', []) if p.get('mandatory') and not (_ids(p) & settled)]
         if hard_promises:
             core['ending_obligations'] = hard_promises
-    optional.sort(key=lambda atom: -atom[0])
+    query_terms = _terms(' '.join(value for value in plan.values() if isinstance(value, str)))
+
+    def evidence_order(atom):
+        rank, key, item = atom
+        if _layer(key) != 'history' or not isinstance(item, dict):
+            return -rank, 0, 0
+        text = _memory_search_text(item)
+        score = sum(len(term) for term in query_terms if term in text)
+        chapter = int((item.get('source') or {}).get('chapter_number') or item.get('chapter_number') or 0)
+        return -max(rank, 50), -score, -chapter
+
+    optional.sort(key=evidence_order)
     available = set()
     for key in ('required_memory', 'current_state', 'planned_promises', 'promise_obligations', 'scheduled_promises'):
         for item in core.get(key, []):
@@ -219,16 +250,30 @@ class ContextCompiler:
         def measure(value):
             if isinstance(value.get('lookup_result'), dict):
                 value['lookup_result']['delivered_count'] = len(value.get('historical_evidence', []))
-            return self.counter.count(dumps(request_envelope(value, schema, system, tools, schema_twice)))
+            return self.counter.count(dumps(request_envelope(model_input(value), schema, system, tools, schema_twice)))
 
         before = measure(original)
         available = None if policy.context_window is None else max(0, policy.context_window - policy.output_reserve - policy.overhead_reserve)
         if prepared or policy.mode == 'off':
             packed, atoms, missing = deepcopy(original), [], []
         else:
-            packed, atoms, missing = organize(original, data.get('context_selection'), stage=stage)
+            packed, atoms, missing = organize(data, data.get('context_selection'), stage=stage)
+        evidence_floor = []
+        if not prepared and policy.mode != 'off' and stage in {'draft', 'revise', 'continuity', 'reader', 'arc', 'ending'}:
+            for layer in ('history', 'recent'):
+                if any(_layer(key) == layer and value for key, value in packed.items()):
+                    evidence_floor.append(layer)
+                    continue
+                for index, (_, key, item) in enumerate(atoms):
+                    if _layer(key) == layer:
+                        packed.setdefault(key, []).append(item)
+                        atoms.pop(index)
+                        evidence_floor.append(layer)
+                        break
         hard_count = measure(packed).tokens
         target = max(policy.soft_target, hard_count)
+        if hard_count >= policy.soft_target:
+            target += sum(LAYER_TARGETS[layer] for layer in evidence_floor)
         if available is not None:
             target = min(target, available)
         selected = 0
@@ -242,7 +287,7 @@ class ContextCompiler:
             else:
                 selected += 1
         organized = measure(packed)
-        final = packed if policy.mode == 'adaptive' else original
+        final = model_input(packed) if policy.mode == 'adaptive' else original
         count = measure(final)
         blocked = ('missing_hard_dependencies' if missing else
                    'unknown_model_capacity' if available is None else
@@ -260,6 +305,7 @@ class ContextCompiler:
             'soft_target': policy.soft_target, 'context_window': policy.context_window,
             'output_reserve': policy.output_reserve, 'overhead_reserve': policy.overhead_reserve,
             'hard_tokens': hard_count, 'layer_tokens': layers, 'layer_soft_targets': LAYER_TARGETS,
+            'evidence_floor_layers': evidence_floor,
             'organization_triggered': before.tokens > policy.soft_target,
             'omitted_optional_count': len(atoms) - selected, 'elastic_expansion': organized.tokens > policy.soft_target,
             'would_exceed_capacity': available is not None and organized.tokens > available,
@@ -274,7 +320,8 @@ def compile_task(task, *, system=SYSTEM, tools=None, schema_twice=False, output_
     stage = task.get('stage', 'draft')
     saved = task.get('input', {}).get('context_diagnostics', {})
     policy = ContextPolicy(**saved['policy']) if saved.get('policy') else ContextPolicy.from_env(stage)
-    profiles = os.environ.get('HULK_CONTEXT_MODEL_WINDOWS')
+    profiles = os.environ.get('HULK_CONTEXT_MODEL_WINDOWS',
+                              dumps(policy.model_windows) if policy.model_windows is not None else None)
     if profiles:
         try:
             windows = json.loads(profiles)

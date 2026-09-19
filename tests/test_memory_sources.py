@@ -15,6 +15,12 @@ def test_evidence_is_resolved_from_immutable_paragraph_not_model_quote():
     with pytest.raises(StoryError):resolve_sources(result,{'body':body})
 
 
+def test_source_paragraphs_handle_single_line_manuscript_layout():
+    from story_core.memory_sources import source_paragraphs
+    paragraphs = source_paragraphs('第一段。\n第二段。\n\n第三段。')
+    assert [item['text'] for item in paragraphs] == ['第一段。', '第二段。', '第三段。']
+
+
 def test_source_submission_is_idempotent_and_cannot_invent_evidence(tmp_path):
     from test_workflow import make,step
     service,book=make(tmp_path,chapters=1)

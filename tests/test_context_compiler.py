@@ -200,3 +200,38 @@ def test_explicit_stable_dependency_survives_optional_eviction(id_field):
     result = compiler(mode='adaptive', context_window=64000, soft_target=1).compile(data, {}, stage='draft')
     assert result.executable
     assert result.input['required_memory'] == [record]
+
+
+def test_large_continuity_core_retains_ranked_history_and_recent_sources():
+    relevant = {'id': 'source-relevant', 'key': '铜牌归属', 'value': '铜牌已归还',
+                'context_reason': 'plan_term', 'source': {'chapter_number': 12, 'version_id': 'v12'}}
+    data = {'candidate': {'body': '正文' * 5000}, 'chapter_plan': {'goal': '核对铜牌归属'},
+            'required_memory': [{'key': str(index), 'value': '无关旧事' * 100, 'context_reason': 'plan_term'}
+                                for index in range(500)] + [relevant],
+            'recent_chapters': [{'chapter_number': 14, 'version_id': 'v14', 'body': '上章结尾' * 400}]}
+    result = compiler(mode='adaptive', context_window=100000).compile(data, {}, stage='continuity')
+    assert result.executable
+    assert result.input['candidate'] == data['candidate']
+    assert {key: value for key, value in relevant.items() if key != 'context_reason'} in result.input.get('supplementary_memory', [])
+    assert result.input.get('recent_chapters', [])[0]['version_id'] == 'v14'
+    assert result.diagnostics['evidence_floor_layers'] == ['history', 'recent']
+    assert result.diagnostics['final_tokens'] <= result.diagnostics['hard_tokens'] + 8500
+    assert len(result.input['supplementary_memory']) < 30
+
+
+def test_missing_space_for_continuity_evidence_blocks_instead_of_reviewing_blind():
+    data = {'candidate': {'body': '正文' * 100},
+            'supplementary_memory': [{'id': 'necessary-source', 'value': '历史事实' * 1500}]}
+    result = compiler(mode='adaptive', soft_target=100, context_window=10000,
+                      output_reserve=1000, overhead_reserve=100).compile(data, {}, stage='continuity')
+    assert not result.executable
+    assert result.input['supplementary_memory'] == data['supplementary_memory']
+    assert result.diagnostics['blocked_reason'] == 'model_capacity'
+
+
+def test_history_floor_prefers_relevance_over_newer_unrelated_record():
+    relevant = {'value': '归还铜牌', 'source': {'chapter_number': 2, 'version_id': 'v2'}}
+    data = {'candidate': {'body': '正文' * 5000}, 'chapter_plan': {'goal': '归还铜牌'},
+            'supplementary_memory': [{'value': '天气晴朗', 'source': {'chapter_number': 14}}, relevant]}
+    result = compiler(mode='adaptive', context_window=100000).compile(data, {}, stage='continuity')
+    assert result.input['supplementary_memory'][0] == relevant

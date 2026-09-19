@@ -6,7 +6,7 @@ from .errors import StoryError
 
 def source_paragraphs(body):
     return [{'id': index + 1, 'text': text} for index, text in enumerate(
-        part for part in re.split(r'\n\s*\n', body) if part.strip())]
+        part.strip() for part in re.split(r'\n+', body) if part.strip())]
 
 
 def resolve_sources(result, candidate):

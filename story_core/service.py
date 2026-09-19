@@ -349,6 +349,42 @@ class StoryService(ContextActions, MemoryActions):
                                       dict(genre=genre, chapter_count=chapter_count, target_words=target_words, mode=mode),
                                       validate_project_metadata(project or {}))
 
+    def update_book_settings(self, book_id, title=None, chapter_count=None, target_words=None, expected_revision=None):
+        if title is not None and (not isinstance(title, str) or not title.strip() or len(title.strip()) > 100):
+            raise StoryError('INVALID_REQUEST', '书名应为 1–100 个字符。')
+        for value, low, high in [(chapter_count, 1, 200), (target_words, 50, 6000)]:
+            if value is not None and (type(value) is not int or not low <= value <= high):
+                raise StoryError('INVALID_REQUEST', '章节数或字数超出支持范围。')
+        with self.store.write(book_id, expected_revision=expected_revision) as conn:
+            book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
+            last = conn.execute('SELECT COALESCE(MAX(number),0) FROM chapters WHERE book_id=?', (book_id,)).fetchone()[0]
+            run = self._latest_run(conn, book_id)
+            active = run and run['status'] in ('running', 'paused', 'needs_attention', 'awaiting_author')
+            minimum = max(last, run['chapter_number'] if active else 0)
+            if chapter_count is not None and chapter_count < minimum:
+                raise StoryError('INVALID_REQUEST', f'章节总数不能少于已保存正文或当前任务所在的第 {minimum} 章。')
+            settings = dict(book['settings'])
+            if chapter_count is not None:
+                settings['chapter_count'] = chapter_count
+            if target_words is not None:
+                settings['target_words'] = target_words
+            title = title.strip() if title is not None else book['title']
+            brief = dict(book['brief']) if book['brief'] else None
+            if brief:
+                brief['title'] = title
+            replan = settings['chapter_count'] != book['settings']['chapter_count'] and bool(book['plan'])
+            if active:
+                conn.execute("UPDATE tasks SET status='cancelled' WHERE run_id=? AND status='leased'", (run['run_id'],))
+                conn.execute("UPDATE workbench_executions SET status='cancelled',finished_at=? WHERE run_id=? AND status='running'", (time.time(), run['run_id']))
+                stage = 'outline' if replan else run['stage']
+                conn.execute("UPDATE runs SET status=?,stage=?,end_chapter=?,reason=? WHERE id=?", ('awaiting_author' if run['status'] == 'awaiting_author' else 'paused', stage, min(run['end_chapter'], settings['chapter_count']), '作品设置已更新，继续写作将使用新设置。', run['run_id']))
+            conn.execute('UPDATE books SET title=?,config=?,brief=?,ending=NULL,revision=revision+1 WHERE id=?',
+                         (title, dumps(settings), dumps(brief) if brief else None, book_id))
+            if replan and not active:
+                conn.execute("UPDATE books SET status='draft' WHERE id=?", (book_id,))
+            self.store.event(conn, book_id, 'book_settings_updated', {'settings': settings, 'replan': replan})
+            return {'book_id': book_id, 'title': title, 'settings': settings, 'revision': book['revision'] + 1, 'replan': replan, 'run_paused': bool(active)}
+
     def project_metadata(self, book_id):
         return self.get_book(book_id)['project']
 
@@ -413,25 +449,39 @@ class StoryService(ContextActions, MemoryActions):
         conn.execute('UPDATE books SET request=?,project=? WHERE id=?', (replace(book['request']), dumps(replace(book['project'])), book['book_id']))
         return replace(brief), replace(plan), renames, count
 
-    def update_story_bible(self, book_id, brief, plan, expected_revision=None):
+    def update_story_bible(self, book_id, brief, plan, expected_revision=None, *, settings=None, apply_character_renames=False):
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise StoryError('INVALID_REQUEST', '作品版本必须是非负整数。')
         with self.store.write(book_id, expected_revision=expected_revision) as conn:
             book = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
+            if settings is not None and (not isinstance(settings, dict) or set(settings) - {'chapter_count', 'target_words'}):
+                raise StoryError('INVALID_REQUEST', '作品设置仅支持章节总数和后续章节字数。')
+            if type(apply_character_renames) is not bool:
+                raise StoryError('INVALID_REQUEST', '历史人物改名选项必须为布尔值。')
+            updated_settings = {**book['settings'], **(settings or {})}
+            if type(updated_settings['chapter_count']) is not int or not book['settings']['chapter_count'] <= updated_settings['chapter_count'] <= 200:
+                raise StoryError('INVALID_REQUEST', '章节总数只能扩展，且不能超过 200 章。')
+            if type(updated_settings['target_words']) is not int or not 50 <= updated_settings['target_words'] <= 6000:
+                raise StoryError('INVALID_REQUEST', '后续章节字数须为 50–6000 的整数。')
+            book = {**book, 'settings': updated_settings}
             validate('brief', brief, book)
             validate('outline', plan, book)
-            brief, plan, renames, renamed_chapters = self._rename_story_characters(conn, book, brief, plan)
+            renames, renamed_chapters = {}, 0
+            if apply_character_renames:
+                brief, plan, renames, renamed_chapters = self._rename_story_characters(conn, book, brief, plan)
             run = self._latest_run(conn, book_id)
-            if run and run['status'] in ('running', 'paused', 'needs_attention'):
+            run_cancelled = bool(run and run['status'] in ('running', 'paused', 'needs_attention', 'awaiting_author'))
+            if run_cancelled:
                 conn.execute("UPDATE runs SET status='cancelled',reason='故事约定或章节骨架已由作者更新，需要使用新上下文重新开始。' WHERE id=?", (run['run_id'],))
                 conn.execute("UPDATE tasks SET status='cancelled' WHERE run_id=? AND status='leased'", (run['run_id'],))
-            conn.execute("UPDATE books SET title=?,brief=?,plan=?,status='draft',revision=revision+1,ending=NULL WHERE id=?",
-                         (brief['title'], dumps(brief), dumps(plan), book_id))
-            self.store.event(conn, book_id, 'story_bible_updated', {'revision_from': book['revision'], 'cancelled_run': bool(run and run['status'] in ('running', 'paused', 'needs_attention'))})
+                conn.execute("UPDATE workbench_executions SET status='cancelled',finished_at=? WHERE run_id=? AND status='running'", (time.time(), run['run_id']))
+            conn.execute("UPDATE books SET title=?,brief=?,plan=?,config=?,status='draft',revision=revision+1,ending=NULL WHERE id=?",
+                         (brief['title'], dumps(brief), dumps(plan), dumps(updated_settings), book_id))
+            self.store.event(conn, book_id, 'story_bible_updated', {'revision_from': book['revision'], 'cancelled_run': run_cancelled, 'settings': updated_settings})
             saved = self.store.decode_book(conn.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
             return {'book_id': book_id, 'title': saved['title'], 'brief': saved['brief'], 'plan': saved['plan'],
                     'renamed_characters': renames, 'renamed_chapters': renamed_chapters,
-                    'revision': saved['revision'], 'run_cancelled': bool(run and run['status'] in ('running', 'paused', 'needs_attention'))}
+                    'settings': saved['settings'], 'revision': saved['revision'], 'run_cancelled': run_cancelled}
 
     def list_books(self, kind='all'):
         if kind not in ('all', 'user', 'sample', 'archived'):
@@ -571,6 +621,8 @@ class StoryService(ContextActions, MemoryActions):
         start = chapter or (first[0] if first else count + 1)
         end = total if chapter_limit is None else min(total, start + chapter_limit - 1)
         stage = 'brief' if not book['brief'] else 'outline' if not book['plan'] else 'extract' if candidate else 'ending' if start > total else 'draft'
+        if book['brief'] and book['plan'] and len(book['plan']['chapters']) != total:
+            stage = 'outline'
         repair = bool(chapter or first)
         if repair and not candidate and start <= total:
             ch = conn.execute('SELECT v.title,v.body FROM chapters c JOIN chapter_versions v ON v.id=c.version_id WHERE c.book_id=? AND c.number=?', (book['book_id'],start)).fetchone()
@@ -629,9 +681,22 @@ class StoryService(ContextActions, MemoryActions):
             return data
         data['brief'] = book['brief']
         if stage == 'outline':
+            if book['plan']:
+                data['previous_plan'] = book['plan']
+                data['instruction'] += '\n这是中途调整篇幅。保留已写章节的骨架与已发生事实，扩展或收束后续世界观、卷纲、章纲和伏笔；不要重写已完成正文。'
             data['context_manifest'] = _context_manifest(book, 'author', 0)
             return data
         data['chapter_plan'] = next((c for c in book['plan']['chapters'] if c['number']==number), None)
+        if stage in ('draft', 'revise', 'arc', 'ending'):
+            structure = {key: book['plan'][key] for key in ('payoff_design', 'climax', 'conflicts', 'reversals', 'joy_points', 'book_climaxes', 'conflicts_reversals') if book['plan'].get(key)}
+            volumes = [volume for volume in book['plan'].get('volumes', []) if
+                       volume.get('range', [volume.get('start_chapter'), volume.get('end_chapter')])[0] <= number <=
+                       volume.get('range', [volume.get('start_chapter'), volume.get('end_chapter')])[1]]
+            if volumes:
+                structure['volumes'] = volumes
+            if structure:
+                data['story_structure'] = structure
+                data['instruction'] += '\nstory_structure 是创作计划，不是已发生事实；只推进本章目标，不能提前兑现后续高潮或把伏笔计划当成记忆。'
         data['arc_window'] = [c for c in book['plan']['chapters'] if abs(c['number']-number)<=2]
         data['planned_promises'] = book['plan']['promises']
         memory_boundary = number if stage in ('ending', 'arc') else number - 1
@@ -707,7 +772,7 @@ class StoryService(ContextActions, MemoryActions):
             if candidate:
                 data['length_requirement']['current_count'] = word_count(candidate['body'])
             data['instruction'] += '\n按 length_requirement.target 写足本章，不以 min 为写作目标。计数不含标点空白；返修后的完整正文（包括应用 patches 后）也须满足范围。原稿不足时，补足本章目标内的尝试、阻力、对话交锋、结果及情绪余波；不能靠重复解释、回顾或无关支线凑字数。删除有问题的说明后保留必要场景，不把去AI味理解为持续缩短正文。length_feedback 是上次实际校验结果，重试须结合它调整正文，不能重复提交同样的删改。'
-            previous = conn.execute("SELECT id,input,status FROM tasks WHERE book_id=? AND run_id=? AND chapter_number=? AND stage=? AND status!='lookup' ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            previous = conn.execute("SELECT id,input,status,base_revision FROM tasks WHERE book_id=? AND run_id=? AND chapter_number=? AND stage=? AND status!='lookup' ORDER BY created_at DESC,rowid DESC LIMIT 1",
                                     (book['book_id'], run['run_id'], number, stage)).fetchone()
             if previous and previous['status'] != 'submitted' and json.loads(previous['input']).get('candidate') == candidate:
                 for row in conn.execute("SELECT payload FROM events WHERE book_id=? AND kind IN ('task_result_rejected','worker_failed') ORDER BY seq DESC", (book['book_id'],)):
@@ -715,6 +780,22 @@ class StoryService(ContextActions, MemoryActions):
                     if failure.get('task_id') == previous['id'] and failure.get('code') == 'WORD_COUNT' and failure.get('details'):
                         data['length_feedback'] = {'task_id': previous['id'], 'count': failure['details'].get('count'), **length_requirement(book['settings']['target_words'])}
                         break
+            if stage == 'draft' and previous and previous['status'] != 'submitted' and previous['base_revision'] == book['revision']:
+                for row in conn.execute("SELECT payload FROM events WHERE book_id=? AND run_id=? AND kind='task_result_rejected' ORDER BY seq DESC", (book['book_id'], run['run_id'])):
+                    failure = json.loads(row['payload'])
+                    if failure.get('task_id') != previous['id'] or failure.get('code') != 'WORD_COUNT':
+                        continue
+                    raw = failure.get('raw_result')
+                    if isinstance(raw, dict) and isinstance(raw.get('title'), str) and isinstance(raw.get('body'), str) and raw['body'].strip():
+                        count = word_count(raw['body'])
+                        bounds = data['length_requirement']
+                        data['length_repair_source'] = {'title': raw['title'], 'body': raw['body']}
+                        data['expansion_requirement'] = {'source_words': count,
+                            'minimum_additional_words': max(0, bounds['min'] - count),
+                            'target_additional_words': max(0, bounds['target'] - count)}
+                        direction = '在现有场景内部补足行动、阻力和对话，保留事件顺序和结局' if count < bounds['min'] else '压缩重复解释与铺垫，保留事件顺序和结局'
+                        data['instruction'] += f"\n本次是初稿长度修复，不是重新起稿。length_repair_source 是上次保存的完整正文，共 {count} 字。以它为底稿，{direction}，达到 {bounds['target']} 字附近。必须返回完整 title/body，不只返回新增段落、不返回修改建议，不得照原样重复提交。"
+                    break
         if stage == 'revise' and candidate:
             if previous and previous['status'] != 'submitted' and json.loads(previous['input']).get('candidate') == candidate:
                 data['revision_mode'] = 'full_body'
@@ -761,7 +842,7 @@ class StoryService(ContextActions, MemoryActions):
             schema = SCHEMAS['revise']['oneOf'][0]
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
         reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
-        policy = ContextPolicy.from_env(run['stage'])
+        policy = ContextPolicy.from_env(run['stage'], self.store.root / 'context-policy.json')
         policy = replace(policy, output_reserve=max(MAX_TASK_OUTPUT_TOKENS, policy.output_reserve))
         if policy.mode == 'adaptive' and run['stage'] not in ('brief', 'outline'):
             from .long_memory import current_state, resolve_alias, select_promises
@@ -1008,6 +1089,8 @@ class StoryService(ContextActions, MemoryActions):
                 raise StoryError('INVALID_LEASE','任务租约或执行者不匹配。')
             if task['stage'] == 'extract':
                 inputs = json.loads(task['input'])
+                if len(json.dumps(result, ensure_ascii=False).encode()) > 100000:
+                    raise StoryError('INVALID_RESULT', '单次任务原始结果过大。', {'phase': 'result_validation', 'next_action': '减少重复记忆，仅提交本章新增且有证据的条目。'})
                 result = resolve_sources(merge_extraction(result, inputs.get('extraction_repair')), inputs.get('candidate'))
             if task['stage'] == 'continuity' and json.loads(task['input']).get('review_adjudication'):
                 inputs = json.loads(task['input'])

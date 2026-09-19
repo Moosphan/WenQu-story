@@ -16,4 +16,11 @@ def model_input(data):
         if isinstance(result.get('evidence'), str) and isinstance(source, dict) and source.get('quote') == result['evidence']:
             source.pop('quote')
         return result
-    return compact({key: value for key, value in data.items() if key not in ('context_manifest', 'context_diagnostics', 'context_selection')})
+    result = compact({key: value for key, value in data.items() if key not in ('context_manifest', 'context_diagnostics', 'context_selection')})
+    for field in ('required_memory', 'supplementary_memory'):
+        memories = result.get(field)
+        if isinstance(memories, list):
+            for memory in memories:
+                if isinstance(memory, dict):
+                    memory.pop('context_reason', None)
+    return result

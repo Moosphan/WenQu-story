@@ -97,3 +97,11 @@ body{font-size:14px}.main-area{background:var(--surface-0)}.sidebar{background:#
 .memory-review-panel .hit > button { margin: 6px 8px 0 0; }
 .memory-review-panel > .form-row { align-items: end; gap: 12px; margin: 18px 0; }
 #memory-page { padding: 10px 0; white-space: nowrap; }
+/* Full-height reading: no nested manuscript viewport or clipped final line. */
+#chapter-body,.writing-focused #chapter-body{height:auto;min-height:calc(100dvh - 180px);max-height:none;overflow:hidden;resize:none;box-sizing:border-box;padding-bottom:40px}
+#manuscript .paper{align-self:start}
+#manuscript .editor-footer{max-width:780px;margin-inline:auto;padding-bottom:12px}
+
+.shelf-trash-dialog{width:min(480px,92vw)}.shelf-trash-dialog h2{font-size:18px;overflow-wrap:anywhere}.shelf-trash-dialog p{line-height:1.8}.shelf-trash-dialog .dialog-actions{gap:10px;flex-wrap:wrap}
+@media(min-width:951px){.writing-layout>.agent-rail{position:sticky;top:18px;align-self:start;display:flex;flex-direction:column;max-height:calc(100vh - 36px);max-height:calc(100dvh - 36px);overflow:hidden}.agent-rail>.agent-title{flex-shrink:0}.agent-rail>.agent-body{min-height:0;overflow-y:auto;overscroll-behavior-y:contain;scrollbar-gutter:stable;scrollbar-width:thin}}
+#book-settings-error{color:var(--amber,#f0bd70)}
