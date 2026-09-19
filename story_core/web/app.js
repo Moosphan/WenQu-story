@@ -963,7 +963,7 @@ function renderStatus() {
   const status = state.status; const run = status.run; const count = status.chapters.committed || 0;
   element('book-status').textContent = statuses[status.status] || status.status;
   element('book-status').className = `pill ${status.status === 'complete' ? 'green' : ''}`;
-  element('agent-mode').textContent = state.executor === 'claude' ? 'Claude Code 执行器' : state.worker ? 'API 执行器' : '宿主协作模式';
+  element('agent-mode').textContent = state.executor === 'codex' ? 'Codex 执行器' : state.executor === 'claude' ? 'Claude Code 执行器' : state.worker ? 'API 执行器' : '宿主协作模式';
   element('agent-dot').classList.toggle('running', !!status.worker_running);
   const reviewStages = ['extract', 'continuity', 'reader', 'arc', 'ending']; const isAiReview = reviewStages.includes(run?.stage);
   element('progress-title').textContent = run ? `第 ${run.chapter_number} 章 · ${isAiReview ? 'AI 自动审校 · ' : ''}${stages[run.stage] || run.stage}` : '等待开始';
@@ -1242,8 +1242,10 @@ function modelPickerOptions(providerId, selected = '') {
 function applyAIProvider(providerId, preserve = false) {
   const provider = state.aiConfig?.providers?.find(item => item.id === providerId); if (!provider) return;
   const isClaude = provider.mode === 'claude';
-  element('ai-api-fields').hidden = isClaude;
-  element('ai-claude-note').hidden = !isClaude;
+  const isCodex = provider.mode === 'codex';
+  element('ai-api-fields').hidden = isClaude || isCodex;
+  element('ai-claude-note').hidden = !isClaude && !isCodex;
+  element('ai-claude-note').textContent = 'Claude Code 使用本机登录和已有配置；保存模型可覆盖新任务的模型选择。';
   if (!preserve) { element('ai-base-url').value = provider.base_url || ''; element('ai-model').value = provider.model || ''; }
   const selected = element('ai-model').value || provider.model || '';
   modelPickerOptions(providerId, selected);
@@ -1253,8 +1255,15 @@ function applyAIProvider(providerId, preserve = false) {
     if (!element('ai-model').value) { element('ai-model').value = local; modelPickerOptions(providerId, local); }
   }
   if (isClaude && state.aiConfig?.host_options?.transport === 'native_deepseek') element('ai-claude-note').textContent += ' 当前使用 DeepSeek 原生 JSON 接口（复用本机连接），思考模式：' + (state.aiConfig.host_options.thinking === 'off' ? '关闭' : '默认') + '；连接参数已持久保存。';
+  if (isCodex) {
+    const local = state.aiConfig?.local_codex || {};
+    let message = !local.installed ? '未发现 Codex CLI。请安装 Codex 桌面应用或 CLI 并登录。' : !local.compatible ? '本机 Codex CLI 无法启动或版本不兼容，请更新 Codex。' : local.login_state !== 'logged_in' ? 'Codex 尚未确认登录。请在 Codex 中完成登录后重新打开此窗口。' : !local.provider_supported ? '本机使用了自定义模型接口，此入口不复用该接口；请改用自定义 OpenAI 兼容接口。' : local.config_state === 'invalid' ? '本机 Codex 配置无法解析，请先修复配置文件。' : `已确认 Codex 本机登录${local.auth_method === 'chatgpt' ? '（ChatGPT）' : local.auth_method === 'api_key' ? '（API Key）' : ''}。`;
+    if (local.ready) message += local.model ? ` 本机模型：${local.model}。可手填模型覆盖；登录凭据由 Codex 管理。` : ' 请手填可用模型；登录凭据由 Codex 管理。';
+    element('ai-claude-note').textContent = message;
+    if (!element('ai-model').value && local.model) { element('ai-model').value = local.model; modelPickerOptions(providerId, local.model); }
+  }
   element('ai-api-key').value = '';
-  element('ai-key-state').textContent = isClaude ? '本机登录' : state.aiConfig?.provider === providerId && state.aiConfig?.key_configured ? '已保存于系统钥匙串' : '尚未保存';
+  element('ai-key-state').textContent = isCodex ? (state.aiConfig?.local_codex?.ready ? '已确认本机登录' : '尚未就绪') : isClaude ? '本机登录' : state.aiConfig?.provider === providerId && state.aiConfig?.key_configured ? '已保存于系统钥匙串' : '尚未保存';
 }
 function updateAISettingsLabel() {
   const provider = state.aiConfig?.providers?.find(item => item.id === state.aiConfig?.provider);
@@ -1263,7 +1272,7 @@ function updateAISettingsLabel() {
 }
 async function loadAIConfig() {
   state.aiConfig = await api('/api/ai-config');
-  const active = state.aiConfig.provider || (state.executor === 'claude' ? 'claude_code' : state.aiConfig.providers?.[0]?.id) || 'openai';
+  const active = state.aiConfig.provider || (state.executor === 'codex' ? 'codex' : state.executor === 'claude' ? 'claude_code' : state.aiConfig.providers?.[0]?.id) || 'openai';
   element('ai-provider').value = active;
   if (state.aiConfig.configured) {
     element('ai-base-url').value = state.aiConfig.base_url || '';

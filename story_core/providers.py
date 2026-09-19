@@ -79,6 +79,9 @@ def configured_provider(executor=None, settings=None):
         from .ai_config import AISettings
         saved = (settings or AISettings()).runtime()
         if saved:
+            if saved['mode'] == 'codex':
+                from .codex_host import CodexCLI
+                return CodexCLI(model=saved.get('model') or None)
             if saved['mode'] == 'claude':
                 from .host import ClaudeCode
                 return ClaudeCode(model=saved.get('model') or None, host_options=saved.get('host_options'))
@@ -89,7 +92,10 @@ def configured_provider(executor=None, settings=None):
         return ClaudeCode()
     if name == 'api':
         return OpenAICompatible.from_env()
-    raise StoryError('INVALID_PROVIDER', 'HULK_EXECUTOR 目前支持 api 或 claude。')
+    if name == 'codex':
+        from .codex_host import CodexCLI
+        return CodexCLI()
+    raise StoryError('INVALID_PROVIDER', 'HULK_EXECUTOR 支持 api、claude 或 codex。')
 
 
 def run_worker(service, book_id, provider, worker_id=None):

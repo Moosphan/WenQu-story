@@ -38,7 +38,9 @@ wenqu --root ./books serve --port 8765
 
 ## 模型配置
 
-**工作台配置**：选择服务商，填写接口地址、模型和 API Key；Claude Code 模式沿用本机安装与登录状态。配置可用性以实际调用结果为准。
+**工作台配置**：选择服务商，填写接口地址、模型和 API Key；Claude Code 模式沿用本机安装与登录状态。选择 **Codex（本机登录）** 可复用 Codex 的 ChatGPT 或 API Key 登录，并读取本机默认模型，也可手填模型覆盖。该入口会分别检测安装、CLI 兼容性和登录状态，不把 ChatGPT 登录当作 OpenAI API Key。配置可用性以实际调用结果为准。
+
+Codex 入口优先发现 macOS 桌面应用自带的 CLI，再检查 PATH；可用 `HULK_CODEX_PATH` 指定可执行文件。需要支持 `exec --ignore-user-config --ephemeral --output-schema --json` 的版本。任务在临时目录中执行，关闭工具与网络搜索，复用现有取消、超时和上下文检查。凭据由 Codex 管理，WenQu 不复制登录令牌。自定义接口配置不会自动迁移到此入口；使用「自定义 OpenAI 兼容接口」配置对应服务。CLI 接入测试使用模拟进程，安装和登录检测不代表已验证该账号的模型调用权限。
 
 **环境变量配置**（名称保留兼容前身版本）：
 

@@ -523,7 +523,8 @@ def test_workbench_exposes_token_costs_and_keychain_backed_ai_configuration():
     assert 'id="ai-provider"' in html
     assert 'id="ai-model-picker"' in html
     assert 'id="connection-dialog"' not in html
-    assert 'ChatGPT / OpenAI API' in html and 'Grok / xAI' in html
+    assert 'OpenAI API' in html and 'Grok / xAI' in html
+    assert 'Codex（本机登录）' in html and 'ChatGPT / OpenAI API' not in html
     assert 'function formatTokens' in script
     assert 'chapterTokenUsage' in script
     assert "api('/api/ai-config'" in script

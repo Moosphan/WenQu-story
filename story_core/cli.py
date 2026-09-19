@@ -85,7 +85,7 @@ def _parser() -> argparse.ArgumentParser:
     export = commands.add_parser("export"); export.add_argument("book"); export.add_argument("--allow-partial", action="store_true")
     mcp = commands.add_parser("mcp"); mcp.add_argument("operation", choices=("serve",))
     worker = commands.add_parser("worker"); worker.add_argument("book")
-    worker.add_argument('--executor', choices=('api', 'claude'))
+    worker.add_argument('--executor', choices=('api', 'claude', 'codex'))
     importer = commands.add_parser("import")
     importer.add_argument("book")
     importer.add_argument("--chapters-file", type=Path, required=True)

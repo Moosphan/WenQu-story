@@ -10,7 +10,8 @@ from .errors import StoryError
 
 KEYCHAIN_SERVICE = 'io.hulk-story-agent.api-key'
 PROVIDERS = {
-    'openai': {'label': 'ChatGPT / OpenAI API', 'mode': 'api', 'base_url': 'https://api.openai.com/v1', 'model': 'gpt-5.2'},
+    'openai': {'label': 'OpenAI API', 'mode': 'api', 'base_url': 'https://api.openai.com/v1', 'model': 'gpt-5.2'},
+    'codex': {'label': 'Codex（本机登录）', 'mode': 'codex', 'base_url': '', 'model': ''},
     'claude_code': {'label': 'Claude Code（本机登录）', 'mode': 'claude', 'base_url': '', 'model': ''},
     'kimi': {'label': 'Kimi / Moonshot', 'mode': 'api', 'base_url': 'https://api.moonshot.cn/v1', 'model': 'kimi-k2'},
     'deepseek': {'label': 'DeepSeek', 'mode': 'api', 'base_url': 'https://api.deepseek.com/v1', 'model': 'deepseek-v4-pro'},
@@ -23,6 +24,7 @@ PROVIDERS = {
 # The catalogue is intentionally local and conservative. It is a convenient picker,
 # not a claim that every account has access to every model.
 MODEL_CATALOG = {
+    'codex': (),
     'openai': ('gpt-5.2', 'gpt-5.1', 'gpt-4.1', 'o3'),
     'claude_code': ('claude-opus-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'),
     'kimi': ('kimi-k2', 'kimi-k2-thinking'),
@@ -96,7 +98,7 @@ class AISettings:
             return None
         except (OSError, ValueError):
             raise StoryError('AI_CONFIG_INVALID', '本地 AI 配置无法读取，请重新保存配置。') from None
-        if not isinstance(value, dict) or value.get('provider') not in PROVIDERS or value.get('mode') not in ('api', 'claude'):
+        if not isinstance(value, dict) or value.get('provider') not in PROVIDERS or value.get('mode') not in ('api', 'claude', 'codex'):
             raise StoryError('AI_CONFIG_INVALID', '本地 AI 配置无效，请重新保存配置。')
         return value
 
@@ -130,16 +132,22 @@ class AISettings:
         return result, local
 
     def public(self):
+        from .codex_discovery import discover_codex
         settings = self._read()
         providers, local = self._providers_public()
-        base = {'providers': providers, 'local_claude': local}
+        codex = discover_codex(self.home)
+        for provider in providers:
+            if provider['id'] == 'codex':
+                provider['models'] = codex['models']
+        base = {'providers': providers, 'local_claude': local, 'local_codex': codex}
         if not settings:
             return {'configured': False, **base}
         provider = settings['provider']
         return {'configured': True, 'provider': provider, 'mode': settings['mode'],
                 'base_url': settings.get('base_url', ''), 'model': settings.get('model', ''),
                 'host_options': settings.get('host_options', {}),
-                'key_configured': bool(self.vault.get(provider)) if settings['mode'] == 'api' else True,
+                'key_configured': (bool(self.vault.get(provider)) if settings['mode'] == 'api'
+                                   else codex['ready'] if settings['mode'] == 'codex' else True),
                 **base}
 
     def save(self, provider, base_url='', model='', api_key='', host_options=None):
@@ -147,7 +155,14 @@ class AISettings:
             raise StoryError('INVALID_PROVIDER', '请选择受支持的平台或自定义兼容接口。')
         preset = PROVIDERS[provider]
         mode = preset['mode']
-        if mode == 'claude':
+        if mode == 'codex':
+            model = model.strip() if isinstance(model, str) else ''
+            if model and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}', model):
+                raise StoryError('INVALID_PROVIDER', 'Codex 模型名称无效。')
+            if host_options or api_key or base_url:
+                raise StoryError('INVALID_PROVIDER', 'Codex 使用本机登录；不在此保存接口地址、密钥或 Claude 选项。')
+            data = {'provider': provider, 'mode': mode, 'base_url': '', 'model': model}
+        elif mode == 'claude':
             model = _clean_model(model)
             if model and not _valid_model(model):
                 raise StoryError('INVALID_PROVIDER', '模型名称需要为 1–160 个可见字符。')
