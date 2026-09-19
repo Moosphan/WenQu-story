@@ -121,16 +121,63 @@ def test_exact_resolution_has_no_lexical_top_k_limit(tmp_path):
 
 def test_shadow_preserves_legacy_context_and_extract_does_not_gain_old_prose(tmp_path, monkeypatch):
     service, book, version, identity = prepared(tmp_path, monkeypatch, stage='extract')
-    assert not service.next_task(book).get('task_id')
+    task = service.next_task(book)
+    assert task.get('task_id'), task
+    assert task['input']['context_diagnostics']['missing_hard_ids'] == []
+    assert 'required_memory' not in task['input']
+    assert 'context_required_ids' not in task['input']
     with service.store.read() as conn:
         from story_core.dependency_resolution import resolve_dependencies
         assert resolve_dependencies(conn, book, {'required_fact_ids': [identity]}, 'extract', 2,
             role='author', pov_entity_id=None) == {'evidence': [], 'state': []}
     monkeypatch.setenv('HULK_CONTEXT_MODE', 'shadow')
-    service.control(book, 'resume')
     task = service.next_task(book)
     assert task.get('task_id')
     assert 'required_memory' not in task['input']
+
+
+def test_extract_ignores_unresolved_outline_promises_but_preserves_prose(tmp_path, monkeypatch):
+    service, book, _, _ = prepared(tmp_path, monkeypatch, stage='extract')
+    with service.store.write(book) as conn:
+        plan = json.loads(conn.execute('SELECT plan FROM books WHERE id=?', (book,)).fetchone()[0])
+        plan['chapters'][1]['promise_ids'] = ['古剑再飞', '铜牌旧案']
+        conn.execute('UPDATE books SET plan=? WHERE id=?', (dumps(plan), book))
+    task = service.next_task(book)
+    assert task.get('task_id'), task
+    assert task['input']['candidate']['body'] == result_for({'stage': 'draft'})['body']
+    assert task['input']['source_paragraphs']
+    assert 'scheduled_promises' not in task['input']
+    service.submit_task(task['task_id'], task['lease_id'], result_for(task))
+    assert service.status(book)['run']['stage'] == 'continuity'
+
+
+def test_reader_resolves_promise_key_from_committed_evidence(tmp_path, monkeypatch):
+    service, book, _, _ = prepared(tmp_path, monkeypatch, stage='reader')
+    seed(service.store, book, 1, '铜牌旧案尚无结论。', [
+        {'kind': 'promise', 'key': '铜牌旧案', 'value': '尚无结论', 'status': 'open',
+         'evidence': '铜牌旧案尚无结论', 'visibility': 'reader'}])
+    with service.store.write(book) as conn:
+        plan = json.loads(conn.execute('SELECT plan FROM books WHERE id=?', (book,)).fetchone()[0])
+        plan['chapters'][1]['required_fact_ids'] = []
+        plan['chapters'][1]['promise_ids'] = ['铜牌旧案']
+        conn.execute('UPDATE books SET plan=? WHERE id=?', (dumps(plan), book))
+    task = service.next_task(book)
+    assert task.get('task_id'), task
+    assert task['input']['context_diagnostics']['missing_hard_ids'] == []
+    assert any(x.get('key') == '铜牌旧案' for x in task['input']['required_memory'])
+    assert 'chapter_plan' not in task['input']
+
+
+def test_reader_does_not_require_unpublished_author_promise(tmp_path, monkeypatch):
+    service, book, _, _ = prepared(tmp_path, monkeypatch, stage='reader')
+    with service.store.write(book) as conn:
+        plan = json.loads(conn.execute('SELECT plan FROM books WHERE id=?', (book,)).fetchone()[0])
+        plan['chapters'][1]['promise_ids'] = ['作者尚未揭露的秘密']
+        conn.execute('UPDATE books SET plan=? WHERE id=?', (dumps(plan), book))
+    task = service.next_task(book)
+    assert task.get('task_id'), task
+    assert task['input']['context_diagnostics']['missing_hard_ids'] == []
+    assert 'planned_promises' not in task['input']
 
 
 def test_resolved_hard_source_obeys_capacity_and_resume_without_model_call(tmp_path, monkeypatch):

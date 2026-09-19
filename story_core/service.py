@@ -925,7 +925,9 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
         reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
         policy = replace(policy, output_reserve=max(MAX_TASK_OUTPUT_TOKENS, policy.output_reserve))
-        if policy.mode == 'adaptive' and run['stage'] not in ('brief', 'outline'):
+        # Extraction is grounded exclusively in the current candidate. Outline
+        # dependencies belong to authoring/review, not this evidence-only step.
+        if policy.mode == 'adaptive' and run['stage'] not in ('brief', 'outline', 'extract'):
             from .long_memory import current_state, resolve_alias, select_promises
             plan = next((c for c in book['plan']['chapters'] if c['number'] == run['chapter_number']), {})
             pov = plan.get('pov')
@@ -950,9 +952,13 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
                 data['semantic_summaries'] = select_summaries(conn, book['book_id'],
                     through_chapter=run['chapter_number'] if run['stage'] in ('arc', 'ending') else run['chapter_number']-1,
                     role=role, pov_entity_id=(pov_id or 'unresolved-pov') if pov else None)
-            # Reader/extraction views intentionally lack author chapter_plan.
+            # Reader views intentionally lack author chapter_plan.
             # Keep only dependency IDs, never its future plot text.
-            data['context_required_ids'] = [*plan.get('required_fact_ids', []), *plan.get('promise_ids', [])]
+            # Reader review must not require author-only future promise plans.
+            # Available published evidence is still resolved below; explicit
+            # fact dependencies retain their normal source/privacy checks.
+            data['context_required_ids'] = [*plan.get('required_fact_ids', []),
+                *(plan.get('promise_ids', []) if run['stage'] != 'reader' else [])]
             data['context_promise_ids'] = plan.get('promise_ids', [])
             data['context_fact_ids'] = plan.get('required_fact_ids', [])
             from .dependency_resolution import resolve_dependencies, attach_dependencies

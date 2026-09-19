@@ -9,15 +9,18 @@ STAGES = {'draft', 'revise', 'continuity', 'reader', 'arc', 'ending'}
 
 def resolve_dependencies(conn, book_id, plan, stage, chapter_number, *, role, pov_entity_id):
     requested = list(dict.fromkeys(plan.get('required_fact_ids', [])))
+    promises = list(dict.fromkeys(plan.get('promise_ids', [])))
     result = {'evidence': [], 'state': []}
-    if stage not in STAGES or not requested:
+    if stage not in STAGES or not (requested or promises):
         return result
     boundary = chapter_number if stage in {'arc', 'ending'} else chapter_number - 1
-    params = {'book': book_id, 'ids': dumps(requested), 'boundary': boundary,
+    params = {'book': book_id, 'ids': dumps(requested), 'promises': dumps(promises), 'boundary': boundary,
               'role': role, 'pov': plan.get('pov') or ''}
     rows = conn.execute('''SELECT m.* FROM memories m JOIN chapters c
         ON c.book_id=m.book_id AND c.number=m.chapter_number AND c.version_id=m.version_id
-        WHERE m.book_id=:book AND m.id IN (SELECT value FROM json_each(:ids))
+        WHERE m.book_id=:book AND (m.id IN (SELECT value FROM json_each(:ids))
+          OR (m.kind='promise' AND (m.id IN (SELECT value FROM json_each(:promises))
+              OR m.key IN (SELECT value FROM json_each(:promises)))))
         AND c.status='committed' AND m.chapter_number<=:boundary
         AND (:role='author' OR m.visibility='reader')
         AND (:pov='' OR (m.visibility='reader' AND
