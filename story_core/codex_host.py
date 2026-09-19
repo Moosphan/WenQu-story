@@ -66,8 +66,8 @@ class CodexCLI(ClaudeCode):
                        '--output-schema', str(schema), '-c', 'approval_policy="never"',
                        '-c', 'web_search="disabled"', '-c', 'project_doc_max_bytes=0',
                        '-c', 'developer_instructions=' + json.dumps(system), '-c', 'mcp_servers={}',
-                       '-c', 'agents.enabled=false', '-c', 'tools.update_plan=false',
-                       '-c', 'tools.experimental_request_user_input=false']
+                       '-c', 'agents.enabled=false', '-c', 'tools.update_plan.enabled=false',
+                       '-c', 'tools.experimental_request_user_input.enabled=false']
             for feature in ('shell_tool', 'unified_exec', 'apply_patch_freeform', 'apps', 'plugins',
                             'hooks', 'codex_hooks', 'plugin_hooks', 'multi_agent', 'multi_agent_v2',
                             'js_repl', 'code_mode', 'computer_use', 'browser_use', 'image_generation',

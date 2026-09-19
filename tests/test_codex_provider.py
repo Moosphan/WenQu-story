@@ -81,6 +81,8 @@ if args == ['login','status']:
 assert '--ignore-user-config' in args and '--ephemeral' in args
 assert args[args.index('--sandbox')+1] == 'read-only'
 assert 'features.shell_tool=false' in args
+assert 'tools.update_plan.enabled=false' in args
+assert 'tools.update_plan=false' not in args
 assert 'CODEX_API_KEY' not in os.environ
 schema=json.loads(pathlib.Path(args[args.index('--output-schema')+1]).read_text())
 assert schema['type']=='object'
