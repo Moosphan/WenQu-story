@@ -111,6 +111,7 @@ def test_proposed_planning_requires_full_volume_roadmap(tmp_path):
     turn, _ = send(service, book, True)
     chat.apply(service, book, turn['id'])
     task = service.next_task(book)
+    assert 'volumes' in task['output_schema']['required']
     with pytest.raises(StoryError): service.submit_task(task['task_id'], task['lease_id'], result_for(task))
 
 
@@ -176,10 +177,18 @@ def test_every_batch_has_direction_and_preserves_candidate_skeleton(tmp_path):
         assert '扩展世界与主线' in task['input']['instruction']
         result = result_for(task)
         result['chapters'] = result['chapters'][bounds['start']-1:bounds['end']]
-        result['volumes'] = [{'number': 1, 'title': '全书', 'range': [1, 45], 'goal': '扩展', 'world_expansion': '远方', 'climax': '结局'}]
-        service.submit_task(task['task_id'], task['lease_id'], result)
+        if len(batches) == 1:
+            assert 'volumes' in task['output_schema']['required']
+            result['volumes'] = [{'number': 1, 'title': '全书', 'range': [1, 45], 'goal': '扩展', 'world_expansion': '远方', 'climax': '结局'}]
+        else:
+            assert 'volumes' not in task['output_schema']['required']
+            with pytest.raises(StoryError):
+                service.submit_task(task['task_id'], task['lease_id'], {**result, 'volumes': []})
+        accepted = service.submit_task(task['task_id'], task['lease_id'], result)
+        assert service.submit_task(task['task_id'], task['lease_id'], result) == accepted
     assert batches == [(2, 21), (22, 41), (42, 45)]
     assert service.get_book(book)['plan']['chapters'][0] == plan['chapters'][0]
+    assert service.get_book(book)['plan']['volumes'][0]['range'] == [1, 45]
     with service.store.read() as conn: assert service._latest_run(conn, book)['candidate'] == candidate
     assert not service.next_task(book).get('task_id')
 

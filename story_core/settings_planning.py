@@ -95,7 +95,7 @@ def public(conn, book, run):
     from .outline_batches import progress
     stale = book['revision'] != job['base_revision']
     proposed = virtual_book(conn, {**book, 'revision': job['base_revision']})
-    plan, _ = progress(conn, proposed, run)
+    plan, seed = progress(conn, proposed, run)
     return {'id': job['id'], 'target_title': job['target']['title'], 'target_settings': job['target']['settings'],
-            'status': 'needs_attention' if stale else run['status'], 'planned_chapters': len(plan['chapters']),
+            'status': 'needs_attention' if stale else run['status'], 'planned_chapters': len(plan['chapters']), 'protected_chapters': seed,
             'reason': '规划期间作品已变化，请取消规划后重新保存设置。' if stale else run.get('reason')}

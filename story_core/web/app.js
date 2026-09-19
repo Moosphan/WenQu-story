@@ -1010,21 +1010,30 @@ function renderStatus() {
   renderExecutionSummary();
   renderEvents(); renderUsage();
   if (run) { element('budget-tokens').placeholder = String(run.budget_tokens); element('max-steps').placeholder = String(run.max_steps); }
+  renderPlanningProgress(status);
+  controls();
+}
+function renderPlanningProgress(status) {
   const planning = status.settings_planning;
   element('settings-planning-panel').hidden = !planning;
+  element('planning-rail').hidden = !planning;
   element('execution-summary').hidden = Boolean(planning);
   element('pipeline').hidden = Boolean(planning);
   if (planning) {
-    element('settings-planning-detail').textContent = `目标 ${planning.target_settings.chapter_count} 章 · 已规划 ${planning.planned_chapters} 章。${planning.reason || (status.worker_running ? '正在后台规划…' : planning.status === 'running' ? '正在启动规划…' : '规划已保留，可继续或取消。')}`;
-    element('resume-planning').hidden = planning.status === 'running' || status.worker_running;
-    element('progress-title').textContent = '作品设置规划';
-    element('progress-detail').textContent = '规划与章节生成分开执行';
+    const running = planning.status === 'running' || status.worker_running;
+    const count = planning.planned_chapters, total = planning.target_settings.chapter_count;
+    const batch = count < total ? `第 ${count + 1}–${Math.min(count + 20, total)} 章` : '最终校验';
+    const detail = `已保存 ${count} / ${total} 章规划${planning.protected_chapters ? `（含前 ${planning.protected_chapters} 章保留骨架）` : ''}。${running ? '当前批次' : '待继续批次'}：${batch}。${planning.reason || (status.worker_running ? 'AI 正在生成；本批通过校验后进度才会更新。' : running ? '正在启动规划…' : '规划已暂停，点击继续规划从断点恢复。')}`;
+    element('settings-planning-detail').textContent = detail;
+    element('planning-rail-detail').textContent = detail;
+    for (const id of ['resume-planning', 'resume-planning-rail']) element(id).hidden = running;
+    element('progress-title').textContent = running ? '独立规划进行中' : '独立规划已暂停';
+    element('progress-detail').textContent = `已保存 ${count} / ${total} 章 · ${running ? '正在处理' : '等待继续'} ${batch}`;
     element('progress').max = planning.target_settings.chapter_count;
     element('progress').value = planning.planned_chapters;
     element('continue').textContent = '规划完成后可继续章节写作';
-    element('reason').textContent = planning.reason || '后台规划会逐批保存；离开页面不影响执行。可取消规划以保留原配置，也可在中断后继续规划。';
+    element('reason').textContent = detail;
   }
-  controls();
 }
 function eventCategory(event) { return ['revision_requested', 'chapter_committed', 'human_feedback_submitted', 'needs_attention'].includes(event.kind) || event.payload.stage === 'reader' || event.payload.stage === 'continuity' ? 'review' : 'execution'; }
 function eventDetail(event) {
@@ -1396,7 +1405,7 @@ function bind() {
     finally { state.busy.delete(button.id); controls(); }
   });
   for (const name of ['pause', 'cancel']) action(name, async () => { await api(`/api/books/${state.book.book_id}/control`, { action: name }); state.task = null; renderContextInspector(null); await refreshStatus(); });
-  for (const [id, operation] of [['resume-planning', 'resume_planning'], ['cancel-planning', 'cancel_planning']]) action(id, async () => {
+  for (const [id, operation] of [['resume-planning', 'resume_planning'], ['cancel-planning', 'cancel_planning'], ['resume-planning-rail', 'resume_planning'], ['cancel-planning-rail', 'cancel_planning']]) action(id, async () => {
     await api(`/api/books/${state.book.book_id}/control`, {action: operation, options: operation === 'resume_planning' ? budgetOptions(element('budget-tokens').value, element('max-steps').value) : {}});
     await refreshStatus();
     notice(operation === 'cancel_planning' ? '已取消规划，原配置和正式章纲保留。' : '正在继续独立规划。');

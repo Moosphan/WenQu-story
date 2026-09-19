@@ -903,7 +903,7 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             schema = SCHEMAS['revise']['oneOf'][0]
         if data.get('outline_batch'):
             from .outline_batches import output_schema
-            schema = output_schema(data['outline_batch'])
+            schema = output_schema(data['outline_batch'], require_volumes=data.get('outline_volume_required', False))
         # UTF-8 bytes upper bound input tokens for mainstream byte tokenizers, plus output cap.
         reservation=len(dumps(model_input(data)).encode())+len(dumps(schema).encode())+MAX_TASK_OUTPUT_TOKENS+1000
         policy = replace(policy, output_reserve=max(MAX_TASK_OUTPUT_TOKENS, policy.output_reserve))
@@ -1207,20 +1207,21 @@ class StoryService(ContextActions, MemoryActions, SummaryActions, BranchActions,
             stage=task['stage']
             planning_job = settings_planning.pending(conn, book['book_id'])
             book = settings_planning.virtual_book(conn, book)
+            planning_result = result
             if stage == 'outline' and planning_job and planning_job['target'].get('direction'):
-                from .outline_batches import validate_proposal_volumes
-                validate_proposal_volumes(result, book['settings']['chapter_count'])
-            processing_result, warning = validate_output(stage, result, book, run['candidate'], json.loads(task['input']))
+                from .outline_batches import proposal_result
+                planning_result = proposal_result(conn, book, run, result)
+            processing_result, warning = validate_output(stage, planning_result, book, run['candidate'], json.loads(task['input']))
             if warning:
                 self.store.event(conn, book['book_id'], 'supplement_rejected',
                     {'task_id': task_id, **warning}, run['run_id'])
             if stage in ('brief','outline'):
                 field='brief' if stage=='brief' else 'plan'
-                published, complete = result, True
+                published, complete = planning_result, True
                 inputs = json.loads(task['input'])
                 if stage == 'outline' and inputs.get('outline_batch'):
                     from .outline_batches import assemble
-                    published, complete = assemble(conn, book, run, inputs, result)
+                    published, complete = assemble(conn, book, run, inputs, planning_result)
                     self.store.event(conn, book['book_id'], 'outline_batch_completed', inputs['outline_batch'], run['run_id'])
                 if complete:
                     conn.execute(f'UPDATE books SET {field}=?,revision=revision+1 WHERE id=?',(dumps(published),book['book_id']))

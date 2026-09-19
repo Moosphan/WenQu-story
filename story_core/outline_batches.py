@@ -41,11 +41,12 @@ def progress(conn, book, run):
 def prepare(conn, book, run, data):
     from .settings_planning import pending
     job = pending(conn, book['book_id'])
-    if job and job['target'].get('direction'):
-        data['instruction'] += '\n作者已确认的全书规划方向（每批均须遵循）：' + job['target']['direction'] + '\n每批必须给出覆盖全书的完整卷纲 volumes；保留已写正文与候选章节的既有事实。'
     if book['settings']['chapter_count'] <= 40 and not job:
         return
     assembled, seed = progress(conn, book, run)
+    if job and job['target'].get('direction'):
+        data['outline_volume_required'] = len(assembled['chapters']) == seed
+        data['instruction'] += '\n作者已确认的全书规划方向（每批均须遵循）：' + job['target']['direction'] + '\n首批必须提供覆盖全书的完整卷纲 volumes；后续批次如无调整可省略 volumes，系统沿用本轮已验证的完整卷纲。若返回 volumes，必须是全书完整卷纲，不能只返回本批对应卷。保留已写正文与候选章节的既有事实。'
     start = len(assembled['chapters']) + 1
     total = book['settings']['chapter_count']
     if start > total:
@@ -62,8 +63,11 @@ def prepare(conn, book, run, data):
         '每章各字段简洁具体；本批完成后系统保存进度并继续下一批，全部完成才发布完整章纲。')
 
 
-def output_schema(batch):
+def output_schema(batch, require_volumes=False):
     schema = deepcopy(SCHEMAS['outline'])
+    if require_volumes:
+        schema['required'].append('volumes')
+        schema['properties']['volumes']['minItems'] = 1
     chapters = schema['properties']['chapters']
     chapters.update(minItems=batch['end']-batch['start']+1, maxItems=batch['end']-batch['start']+1)
     chapters['items']['properties']['number'].update(minimum=batch['start'], maximum=batch['end'])
@@ -81,6 +85,16 @@ def assemble(conn, book, run, inputs, result):
     if complete:
         validate('outline', assembled, book, result_size_limit=100000*((batch['total']+SIZE-1)//SIZE))
     return assembled, complete
+
+
+def proposal_result(conn, book, run, result):
+    """Missing unchanged volumes inherit only this revision's accepted batches."""
+    if isinstance(result, dict) and 'volumes' not in result:
+        assembled, seed = progress(conn, book, run)
+        if len(assembled['chapters']) > seed and assembled.get('volumes'):
+            result = {**result, 'volumes': assembled['volumes']}
+    validate_proposal_volumes(result, book['settings']['chapter_count'])
+    return result
 
 
 def validate_proposal_volumes(result, total):
