@@ -69,3 +69,107 @@ def test_real_store_history_and_verified_summary_authorize_sources(tmp_path):
     for strategy in ('full-history','verified-summary'):
         assert report['strategies'][strategy]['metrics']['recall']['value']==1
         assert report['strategies'][strategy]['metrics']['forbidden_leaks']==0
+
+
+def test_repeated_distance_checkpoints_have_no_independence_intervals():
+    report = evaluate([case(str(i)) for i in range(101)],
+                      {'full-history': lambda c, k: {'hits': [{'id': 'a'}]}}, k=1)
+    strategy = report['strategies']['full-history']
+    assert strategy['metrics']['mrr']['ci95'] is not None
+    for value in strategy['distance_metrics'].values():
+        if isinstance(value, dict):
+            assert value['ci95'] is None
+            assert 'correlated' in value['ci_method']
+    assert strategy['distance_metrics']['mrr']['denominator'] == 100
+
+
+@pytest.fixture
+def synthetic_semantic_store(tmp_path, monkeypatch):
+    from story_core.storage import Store
+    from story_core.retrieval import initialize_index
+    from story_core import semantic_retrieval as semantic
+    store = Store(tmp_path)
+    book = store.create_book('synthetic', 'synthetic', {})['book_id']
+    with store.write(book) as conn:
+        initialize_index(conn)
+        semantic._schema(conn)
+    (tmp_path / 'retrieval-policy.json').write_text(json.dumps({'strategy': 'semantic'}))
+    calls = []
+
+    class SyntheticSemanticAdapter:
+        def __init__(self, store, policy):
+            pass
+
+        def prepare_query(self, query):
+            calls.append(query)
+            return semantic.PreparedSemanticQuery(query, [], 'synthetic')
+
+        def candidates(self, query, scope, limit):
+            return []
+
+    monkeypatch.setattr(semantic, 'LocalSemanticAdapter', SyntheticSemanticAdapter)
+    item = case()
+    item['scope']['book_id'] = book
+    return store, item, calls
+
+
+def test_unsupported_semantic_branch_is_unavailable(synthetic_semantic_store):
+    store, item, calls = synthetic_semantic_store
+    item['scope']['branch_id'] = 'unsupported'
+    report = evaluate([item], store_adapters(store, allow_local_model=True))
+    for name in ('vector-only', 'hybrid'):
+        assert report['strategies'][name]['status'] == 'unavailable'
+        assert report['strategies'][name]['metrics'] is None
+    assert calls == []
+
+
+@pytest.mark.parametrize('missing', [True, False])
+def test_missing_or_incomplete_semantic_index_is_unavailable(synthetic_semantic_store, missing):
+    store, item, calls = synthetic_semantic_store
+    with store.write(item['scope']['book_id']) as conn:
+        if missing:
+            conn.execute('DROP TABLE semantic_vectors')
+        else:
+            from story_core.memory import index_chapter
+            book = item['scope']['book_id']
+            conn.execute('INSERT INTO chapter_versions VALUES (?,?,?,?,?,?)',
+                         ('v1', book, 1, 'fixture', '铜牌借你。', 0))
+            conn.execute("INSERT INTO chapters VALUES (?,?,?,'committed')", (book, 1, 'v1'))
+            index_chapter(conn, book, 1, 'v1', '铜牌借你。',
+                          [dict(kind='fact', key='铜牌', value='铜牌借你', evidence='铜牌借你')])
+    report = evaluate([item], store_adapters(store, allow_local_model=True))
+    for name in ('vector-only', 'hybrid'):
+        assert report['strategies'][name]['status'] == 'unavailable'
+        assert report['strategies'][name]['metrics'] is None
+        assert report['strategies'][name]['local_embedding_calls'] == 1
+    assert report['local_embedding_calls'] == len(calls) == 2
+
+
+def test_local_embeddings_are_counted_separately(synthetic_semantic_store):
+    store, item, calls = synthetic_semantic_store
+    adapters = store_adapters(store, allow_local_model=True)
+    for _ in range(2):
+        report = evaluate([item], adapters)
+        assert report['local_embedding_calls'] == 2
+        assert report['real_model_calls'] == report['remote_generation_calls'] == 0
+        for name in ('vector-only', 'hybrid'):
+            assert report['strategies'][name]['status'] == 'available'
+            assert report['strategies'][name]['local_embedding_calls'] == 1
+    assert len(calls) == 4
+
+
+def test_encoding_before_backend_exception_is_still_counted(synthetic_semantic_store, monkeypatch):
+    from story_core import semantic_retrieval as semantic
+    from story_core.errors import StoryError
+    store, item, calls = synthetic_semantic_store
+
+    def unavailable(*args):
+        raise StoryError('SEMANTIC_INDEX_UNAVAILABLE', 'Synthetic unavailable index')
+
+    monkeypatch.setattr(semantic.LocalSemanticAdapter, 'candidates', unavailable)
+    report = evaluate([item], store_adapters(store, allow_local_model=True))
+    assert report['local_embedding_calls'] == len(calls) == 2
+    for name in ('vector-only', 'hybrid'):
+        assert report['strategies'][name]['status'] == 'unavailable'
+        assert report['strategies'][name]['metrics'] is None
+        assert report['strategies'][name]['local_embedding_calls'] == 1

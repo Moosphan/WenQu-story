@@ -44,7 +44,7 @@ def ratio(numerator, denominator):
     return dict(numerator=numerator, denominator=denominator, value=p, ci95=[max(0,center-half),min(1,center+half)], ci_method='Wilson descriptive; labels within query may correlate')
 
 
-def metrics(rows, k):
+def metrics(rows, k, *, independent=True):
     recall_n=recall_d=precision_n=unknown_n=unknown_d=hard_n=hard_d=leaks=0
     reciprocal=[]
     for case, result in rows:
@@ -59,9 +59,14 @@ def metrics(rows, k):
     n=len(reciprocal); mean=sum(reciprocal)/n if n else None
     # Distribution-free Hoeffding interval for bounded per-query reciprocal rank.
     radius=math.sqrt(math.log(40)/(2*n)) if n else None
-    return {'recall':ratio(recall_n,recall_d), 'precision':ratio(precision_n,k*len(rows)),
+    result = {'recall':ratio(recall_n,recall_d), 'precision':ratio(precision_n,k*len(rows)),
             'mrr':dict(numerator=sum(reciprocal),denominator=n,value=mean,ci95=[max(0,mean-radius),min(1,mean+radius)] if n else None,ci_method='Hoeffding per independent query'),
             'forbidden_leaks':leaks,'unknown_false_positive':ratio(unknown_n,unknown_d),'hard_required_preservation':ratio(hard_n,hard_d)}
+    if not independent:
+        for value in result.values():
+            if isinstance(value, dict):
+                value.update(ci95=None, ci_method='Descriptive only; correlated distance checkpoints')
+    return result
 
 
 def percentile(values,p):
@@ -72,39 +77,68 @@ def evaluate(cases, adapters, k=10):
     if type(k) is not int or not 1<=k<=50: raise ValueError('k must be 1–50')
     output={'k':k,'unique_query_count':len({c['independent_query_id'] for c in cases}),
             'distance_checkpoint_count':len(cases)-len({c['independent_query_id'] for c in cases}),
-            'strategies':{},'real_model_calls':0,'generation_quality':None,'style_continuity':None,'actual_bill':None}
+            'strategies':{},'real_model_calls':0,'remote_generation_calls':0,'local_embedding_calls':0,
+            'model_call_definitions':{'real_model_calls':'Compatibility alias for remote_generation_calls; excludes local embeddings',
+                                      'local_embedding_calls':'Successful local query encodings, including encodings before retrieval failure'},
+            'generation_quality':None,'style_continuity':None,'actual_bill':None}
     for name in STRATEGIES:
         adapter=adapters.get(name)
         if adapter is None:
-            output['strategies'][name]={'status':'unavailable','metrics':None,'reason':'Required backend/artifact not enabled'}; continue
-        rows=[]; records=[]; failure=None
+            output['strategies'][name]={'status':'unavailable','metrics':None,'local_embedding_calls':0,'reason':'Required backend/artifact not enabled'}; continue
+        rows=[]; records=[]; failure=None; embedding_calls=0
         for case in cases:
             start=perf_counter(); cpu=process_time()
+            before_embeddings=getattr(adapter,'local_embedding_calls',0)
             try: result=adapter(case,k)
             except Exception as exc:
                 failure=f'{type(exc).__name__}: {exc}'; break
+            finally:
+                completed=getattr(adapter,'local_embedding_calls',0)-before_embeddings
+                embedding_calls+=completed
+                output['local_embedding_calls']+=completed
             if result.get('status')=='unavailable': failure=result.get('reason','backend unavailable'); break
             rows.append((case,result))
             records.append(dict(case_id=case['case_id'], latency_ms=(perf_counter()-start)*1000,cpu_ms=(process_time()-cpu)*1000,
                                 input_bytes=len(json.dumps(result['hits'],ensure_ascii=False).encode()),candidate_count=result.get('candidates_examined',len(result['hits'])),truncated=result.get('retrieval_truncated',False)))
         if failure:
-            output['strategies'][name]={'status':'unavailable','metrics':None,'reason':failure}; continue
+            output['strategies'][name]={'status':'unavailable','metrics':None,'local_embedding_calls':embedding_calls,'reason':failure}; continue
         independent=[]; distance=[]; seen=set(); categories=defaultdict(list)
         for row in rows:
             id=row[0]['independent_query_id']
             if id in seen: distance.append(row)
             else: independent.append(row); categories[row[0]['category']].append(row); seen.add(id)
-        output['strategies'][name]={'status':'available','metrics':metrics(independent,k),'distance_metrics':metrics(distance,k),
+        output['strategies'][name]={'status':'available','local_embedding_calls':embedding_calls,
+            'metrics':metrics(independent,k),'distance_metrics':metrics(distance,k,independent=False),
             'categories':{category:metrics(group,k) for category,group in categories.items()},'records':records,
             'latency_ms':{'p50':percentile([r['latency_ms'] for r in records],.5),'p95':percentile([r['latency_ms'] for r in records],.95)}}
     output['limitations']=['First occurrence per independent_query_id contributes to quality metrics; later occurrences are distance checkpoints.',
+        'Distance checkpoint statistics are descriptive only; correlated rows receive no confidence intervals.',
         'Full-history measures source availability; top-k follows descending chapter then ID, not model understanding.',
         'Precision denominator is k per query, including empty answer slots. No 95% population-quality claim from synthetic labels.']
     return output
 
 
+class _SemanticEvaluationAdapter:
+    def __init__(self, store, policy):
+        self.store, self.policy = store, policy
+        self.local_embedding_calls = 0
+
+    def __call__(self, case, k):
+        from .retrieval import RetrievalScope, retriever_for
+        scope = RetrievalScope(**case['scope'])
+        if scope.branch_id != 'main':
+            return {'status':'unavailable','reason':'Semantic archive only supports main branch'}
+        retriever = retriever_for(self.store, self.policy)
+        query = retriever.prepare_query(case['query'])
+        self.local_embedding_calls += 1
+        result = retriever.search(query, scope, limit=k)
+        if result.get('index_complete') is False:
+            return {'status':'unavailable','reason':result.get('reason', 'Required retrieval index is missing or incomplete')}
+        return result
+
+
 def store_adapters(store, summary_path=None, allow_local_model=False):
-    from .retrieval import RetrievalScope, retriever_for
+    from .retrieval import RetrievalScope
     def history(case,k):
         scope=RetrievalScope(**case['scope'])
         if scope.branch_id!='main': return {'status':'unavailable','reason':'Full-history archive only supports main branch'}
@@ -141,10 +175,7 @@ def store_adapters(store, summary_path=None, allow_local_model=False):
         policy=load_policy(store)
         if policy.get('strategy')!='lexical':
             for name, mode in (('vector-only','semantic'),('hybrid','hybrid')):
-                def search(case,k,mode=mode):
-                    retriever=retriever_for(store,{**policy,'strategy':mode})
-                    return retriever.search(case['query'],RetrievalScope(**case['scope']),limit=k)
-                adapters[name]=search
+                adapters[name]=_SemanticEvaluationAdapter(store,{**policy,'strategy':mode})
     return adapters
 
 
